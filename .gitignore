@@ -1,0 +1,50 @@
+# env & secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Litmus runtime
+artifacts/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# ---------------------------------------------------------------------------
+# Private build docs (keep on disk for local development; never push to GitHub)
+# ---------------------------------------------------------------------------
+/PLAN.md
+/START_HERE.md
+/AGENTS.md
+/DOCS.md
+/docs/M0.md
+/docs/M1.md
+/docs/M2.md
+/docs/M3.md
+/docs/M4.md
+/docs/M5.md
+/docs/M6.md
+/docs/progress.md
+/docs/GIT.md
+/docs/README.md
+/docs/FIXTURE.md
+/docs/fixture-ground-truth.json
