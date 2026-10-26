@@ -1,0 +1,15 @@
+# Bazaar fixture - a target to run against.
+#
+# The APK is consumed as a release artifact (local path first, then URL).
+# Adding a target = adding a YAML + an APK URL; nothing else changes.
+
+name: bazaar
+package: com.bazaar.demo
+profile: profiles/bazaar.yaml
+apk:
+  local: ../bazaar/app/build/outputs/apk/debug/app-debug.apk
+  url: https://github.com/<owner>/bazaar/releases/download/v1.0.3/app-debug.apk
+mock_api:
+  cmd: python ../bazaar/mock-api/main.py
+  port: 8100
+  health: http://127.0.0.1:8100/health

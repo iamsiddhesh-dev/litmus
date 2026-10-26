@@ -1,0 +1,64 @@
+{
+  "target": "bazaar",
+  "package": "com.bazaar.demo",
+  "version": "1.0.3",
+  "generated_for": "QA agent benchmark — ground truth, not a claim of findings",
+  "expected": [
+    {
+      "id": "B1",
+      "kind": "crash",
+      "signature": "java.lang.NullPointerException:Integer.intValue",
+      "deterministic": true,
+      "expected_repro_rate": 1.0,
+      "expected_verdict": "confirmed",
+      "trigger": "ProductActivity: tap btn_add_cart twice"
+    },
+    {
+      "id": "B2",
+      "kind": "http_5xx",
+      "signature": "500 POST /api/checkout",
+      "deterministic": true,
+      "expected_repro_rate": 1.0,
+      "expected_verdict": "confirmed",
+      "trigger": "CartActivity: tap btn_checkout"
+    },
+    {
+      "id": "B3",
+      "kind": "deadtap",
+      "signature": "deadtap:btn_apply_coupon",
+      "deterministic": true,
+      "expected_repro_rate": 1.0,
+      "expected_verdict": "confirmed",
+      "trigger": "CartActivity: tap btn_apply_coupon"
+    },
+    {
+      "id": "B4",
+      "kind": "ui_broken",
+      "signature": "overlap:tv_product_title,tv_product_price",
+      "deterministic": true,
+      "expected_repro_rate": 1.0,
+      "expected_verdict": "confirmed",
+      "trigger": "ProductActivity: visible on entry"
+    },
+    {
+      "id": "B5",
+      "kind": "crash",
+      "signature": "java.lang.NullPointerException:express checkout: session token missing",
+      "deterministic": false,
+      "expected_repro_rate": 0.333,
+      "expected_verdict": "flaky",
+      "trigger": "CatalogActivity: tap btn_express"
+    }
+  ],
+  "must_not_report": [
+    "200 POST /api/login",
+    "200 GET /api/products",
+    "any unsupported_abi finding (app has no native libs)",
+    "any pinning finding (backend is plain HTTP)"
+  ],
+  "scoring": {
+    "recall": "confirmed B1-B4 / 4",
+    "flaky_drop": "B5 verdict == flaky",
+    "false_positives": "confirmed findings not matching B1-B4"
+  }
+}

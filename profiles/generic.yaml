@@ -1,0 +1,40 @@
+# Generic profile - the app-agnostic default.
+#
+# A profile describes how to drive one app: credentials, network allow-list,
+# which detectors are enabled, and the crawl limits. It contains no
+# app-specific bug knowledge; target-specific data lives in fixtures/.
+
+profile_name: generic
+
+package: null
+version: null
+
+# Credentials are used to fill login forms when the crawler finds a password
+# field. Leave empty and the crawler will use the LLM to propose test values.
+credentials:
+  email: ""
+  password: ""
+
+# Hosts the app is allowed to talk to. Empty means "do not filter".
+allowed_hosts: []
+
+seed: {}
+
+limits:
+  steps: 25
+  settle_ms: 4000
+  settle_timeout_ms: 12000
+
+detectors:
+  enable:
+    - crash
+    - anr
+    - http_5xx
+    - deadtap
+    - ui_broken
+  disable: []
+
+verify:
+  mode: pm_clear
+  attempts: 3
+  inter_attempt_delay_ms: 1500
