@@ -1,0 +1,47 @@
+# Bazaar profile - the platform side of the fixture's contract.
+#
+# Source of truth: E:\bazaar\contract.md (read-only fixture repo).
+# This file holds only how to *drive* the app; the seeded defects and their
+# expected signals live in E:\bazaar\benchmark\expected_findings.json.
+
+profile_name: bazaar
+
+package: com.bazaar.demo
+version: "1.0.3"
+
+# Login is not validated by the app, but the form must be filled to navigate.
+credentials:
+  email: qa@bazaar.dev
+  password: test1234
+
+# The app talks to the local mock backend only.
+allowed_hosts:
+  - "10.0.2.2:8100"
+
+seed:
+  cart_items: 0
+
+limits:
+  steps: 25
+  settle_ms: 4000
+  settle_timeout_ms: 12000
+
+detectors:
+  enable:
+    - crash
+    - anr
+    - http_5xx
+    - http_4xx
+    - deadtap
+    - ui_broken
+  disable: []
+
+verify:
+  mode: pm_clear
+  attempts: 3
+  inter_attempt_delay_ms: 1500
+
+expect:
+  confirmed: 4
+  flaky: 1        # when the random bug fires; 0 is valid if the crawl never triggers it
+  filtered: 0

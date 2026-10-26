@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "litmus"
+version = "0.1.0"
+description = "Litmus - a litmus test for mobile bugs: explore, detect, replay 3x, report what survives."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Litmus" }]
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "pyyaml>=6.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+    "sqlalchemy[asyncio]>=2.0.30",
+    "asyncpg>=0.29",
+    "redis>=5.0",
+    "arq>=0.25",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+runner = [
+    "uiautomator2>=3.2",
+]
+proxy = [
+    "mitmproxy>=11.0",
+]
+llm = [
+    "litellm>=1.44",
+]
+
+[project.scripts]
+mqa = "litmus.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/<owner>/litmus"
+
+[tool.setuptools.packages.find]
+include = ["litmus*"]
+
+[tool.setuptools.package-data]
+litmus = ["db/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
