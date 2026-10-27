@@ -42,6 +42,7 @@
     "logcat_full.txt": "logcat full",
     "trace.json": "trace.json",
     "manifest.json": "manifest",
+    "flows.json": "proxy flow",
   };
 
   const state = {
@@ -298,7 +299,7 @@
       card.appendChild(el("div", "finding-meta", meta.join(" · ")));
 
       const links = el("div", "finding-links");
-      const order = ["screen_at_bug.png", "repro.py", "logcat.txt", "trace.json", "manifest.json", "screen_before.png", "logcat_full.txt"];
+      const order = ["screen_at_bug.png", "repro.py", "flows.json", "logcat.txt", "trace.json", "manifest.json", "screen_before.png", "logcat_full.txt"];
       const artifacts = (entry.artifacts || []).slice().sort(
         (a, b) => order.indexOf(a.kind) - order.indexOf(b.kind)
       );

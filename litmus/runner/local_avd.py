@@ -174,6 +174,10 @@ class LocalAvd:
         ):
             driver.shell("settings", "put", "global", setting, "0", check=False)
         driver.shell("settings", "put", "global", "stay_on_while_plugged_in", "3", check=False)
+        # A crash dialog ("app keeps stopping") is a system window that survives
+        # pm clear and sits on top of the relaunch, so the crawl would stall on
+        # the screen it just confirmed. It is not part of the app under test.
+        driver.shell("settings", "put", "global", "hide_error_dialogs", "1", check=False)
         # Suppress the "you are in immersive mode" overlay: it covers the app
         # window and is not part of any run.
         driver.shell(

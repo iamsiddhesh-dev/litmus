@@ -77,8 +77,11 @@ def run(
         "device": "cyan",
         "install": "cyan",
         "launch": "cyan",
+        "proxy": "cyan",
         "step": "white",
+        "detect": "magenta",
         "crash": "red",
+        "recover": "yellow",
         "verify": "cyan",
         "attempt": "white",
         "verdict": "green",
@@ -130,15 +133,40 @@ def run(
 
 @app.command()
 def bench(
-    fixture: str = typer.Option(..., "--fixture", help="Fixture name (see fixtures/)."),
+    fixture: str = typer.Option("bazaar", "--fixture", help="Fixture name (see fixtures/)."),
     runs: int = typer.Option(3, "--runs", help="Number of benchmark runs."),
+    steps: int = typer.Option(25, "--steps", help="Explore step budget per run."),
+    apk: str = typer.Option(None, "--apk", help="Override the fixture APK path."),
+    serial: str = typer.Option(None, "--serial", help="adb serial."),
 ) -> None:
-    """Score the platform against a fixture's ground truth (available from M3)."""
-    typer.secho(
-        f"mqa bench is not implemented yet - fixture={fixture} runs={runs}. It lands in M3.",
-        fg="yellow",
-    )
-    raise typer.Exit(code=2)
+    """Score the platform against a fixture's ground truth (PLAN §14)."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    from litmus.config import REPO_ROOT
+
+    script = REPO_ROOT / "benchmark" / "run_bench.py"
+    if not script.is_file():
+        typer.secho(f"FAIL  benchmark runner missing: {script}", fg="red", err=True)
+        raise typer.Exit(code=2)
+    spec = importlib.util.spec_from_file_location("litmus_bench", script)
+    if spec is None or spec.loader is None:
+        typer.secho(f"FAIL  cannot load {script}", fg="red", err=True)
+        raise typer.Exit(code=2)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    argv = ["--fixture", fixture, "--runs", str(runs), "--steps", str(steps)]
+    if apk:
+        if not Path(apk).is_file():
+            typer.secho(f"FAIL  apk not found: {apk}", fg="red", err=True)
+            raise typer.Exit(code=2)
+        argv += ["--apk", apk]
+    if serial:
+        argv += ["--serial", serial]
+    raise typer.Exit(code=module.main(argv))
 
 
 @app.command()

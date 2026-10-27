@@ -63,9 +63,15 @@ def _sha256(path: Path) -> str | None:
     return digest.hexdigest()
 
 
-def _repro_trace(steps: list[StepRecord], trigger: int | None) -> list[dict]:
+def _repro_trace(steps: list[StepRecord], trigger: int | None, start: int = 0) -> list[dict]:
+    """The steps a standalone repro must replay.
+
+    ``start`` is the first step of the finding's segment: after a crash the app
+    is relaunched, so a cart finding must not replay the earlier crash steps.
+    """
+    begin = max(0, min(start, len(steps) - 1)) if steps else 0
     limit = len(steps) if trigger is None else min(trigger + 1, len(steps))
-    return [step.to_dict() for step in steps[:limit]]
+    return [step.to_dict() for step in steps[begin:limit]]
 
 
 def _render_repro(
@@ -74,6 +80,7 @@ def _render_repro(
     component: str,
     trace: list[dict],
     settle_cap_ms: int,
+    density_scale: float = 2.0,
 ) -> str:
     template = (Path(__file__).with_name("repro_template.tmpl")).read_text(encoding="utf-8")
     return (
@@ -84,6 +91,8 @@ def _render_repro(
         .replace("__COMPONENT__", json.dumps(component))
         .replace("__FINGERPRINT__", json.dumps(finding.fingerprint))
         .replace("__SETTLE_MS__", str(int(settle_cap_ms)))
+        .replace("__DENSITY__", repr(float(density_scale or 2.0)))
+        .replace("__PROBE__", json.dumps(finding.probe, indent=2))
         .replace("__TRACE__", json.dumps(trace, indent=2))
     )
 
@@ -107,13 +116,14 @@ def write_bundle(
     package: str,
     component: str,
     settle_cap_ms: int = 4000,
+    density_scale: float = 2.0,
 ) -> EvidenceBundle:
     """Write the evidence bundle for one finding and return its paths."""
     finding_dir = run_dir / finding.local_id
     finding_dir.mkdir(parents=True, exist_ok=True)
     finding.evidence_dir = finding_dir
 
-    trace = _repro_trace(steps, finding.step_idx)
+    trace = _repro_trace(steps, finding.step_idx, finding.trace_start)
     trace_path = finding_dir / "trace.json"
     trace_path.write_text(
         json.dumps(
@@ -139,8 +149,18 @@ def write_bundle(
 
     repro_path = finding_dir / "repro.py"
     repro_path.write_text(
-        _render_repro(finding, package, component, trace, settle_cap_ms), encoding="utf-8"
+        _render_repro(
+            finding, package, component, trace, settle_cap_ms, density_scale
+        ),
+        encoding="utf-8",
     )
+
+    # Kind-specific evidence (the proxy flow behind an http finding, for example).
+    extra_paths: list[Path] = []
+    for name, payload in (finding.evidence or {}).items():
+        path = finding_dir / name
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        extra_paths.append(path)
 
     attempt = _pick_attempt(verification)
     logcat_path = finding_dir / "logcat.txt"
@@ -165,6 +185,7 @@ def write_bundle(
         logcat_path,
         finding_dir / "screen_before.png",
         finding_dir / "screen_at_bug.png",
+        *extra_paths,
     ]
     manifest = {
         "tool": "litmus",

@@ -477,6 +477,7 @@ class Driver:
         self.timeout = timeout
         self.package = ""
         self._screen_size: tuple[int, int] | None = None
+        self._density: float | None = None
         self._u2 = None
         self._u2_failed = False
 
@@ -573,6 +574,36 @@ class Driver:
             return False
         match = re.search(r"mInputShown=(\w+)", out)
         return bool(match and match.group(1).lower() == "true")
+
+    def toast_visible(self) -> bool:
+        """True while a Toast window is on screen.
+
+        A Toast is its own window and never appears in the hierarchy, so it is
+        the only evidence that a tap with no hierarchical effect did something
+        (Bazaar's first add-to-cart tap raises "Added to cart"). Sampled while a
+        tap settles - a Toast lasts about a second.
+        """
+        try:
+            out = self.shell("dumpsys", "window", "windows", timeout=20)
+        except AdbError:
+            return False
+        return bool(
+            re.search(r"Window\{[^}]*\bToast\}", out) or "appop=TOAST_WINDOW" in out
+        )
+
+    def density_scale(self) -> float:
+        """Screen density in dp units, e.g. ``2.0`` for a 320 dpi device."""
+        if self._density is None:
+            scale = 2.0
+            try:
+                out = self.shell("wm", "density")
+            except AdbError:
+                out = ""
+            match = re.search(r"(?:Physical|Override) density:\s*(\d+)", out)
+            if match:
+                scale = int(match.group(1)) / 160.0
+            self._density = scale
+        return self._density
 
     # -- hierarchy --------------------------------------------------------
     def _u2_device(self):

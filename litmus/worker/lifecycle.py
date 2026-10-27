@@ -1,9 +1,20 @@
-"""Run lifecycle: install -> explore -> detect -> verify -> evidence (M1).
+"""Run lifecycle: install -> explore -> detect -> verify -> evidence.
 
 The loop follows PLAN §5.1: dump, filter to the app package, hash, pick an
 action, act, settle by polling, detect, record. Verification follows §5.2:
 ``pm clear``, launch, replay the trace with selectors only, poll for the
 signature, count valid attempts.
+
+M3 adds three things the M1 slice could skip:
+
+* a mitmproxy instance (``runner/proxy.py``) for the whole run, with the
+  emulator proxy cleared in ``finally`` even when the run fails;
+* every detector (crash, ANR, http_5xx/4xx, dead tap, broken UI) sharing the
+  same step loop and the same evidence bundle;
+* a **restart after a crash**. A crawl that stopped at B1 would never reach
+  the cart, so B2 and B3 would be unreachable. The app is relaunched and the
+  crawl continues in a new trace *segment*; a finding's replay starts at its
+  own segment so it never replays the earlier crash.
 """
 
 from __future__ import annotations
@@ -23,10 +34,31 @@ import yaml
 
 from litmus.config import REPO_ROOT, Settings, get_settings
 from litmus.db import repo
+from litmus.detectors.anr import AnrDetector, AnrEvent
 from litmus.detectors.base import Finding
 from litmus.detectors.crash import CrashDetector, CrashEvent
-from litmus.runner.driver import Driver, Screen
+from litmus.detectors.deadtap import (
+    DeadTapDetector,
+    TapObservation,
+    node_content_hash,
+    screen_content_hash,
+)
+from litmus.detectors.environment import (
+    classify_environment,
+    filtered_finding,
+    find_environment_signal,
+)
+from litmus.detectors.network import (
+    NetworkDetector,
+    NetworkEvent,
+    app_flows,
+    load_flows,
+    unreachable_hosts,
+)
+from litmus.detectors.ui import UIScanner
+from litmus.runner.driver import Driver, Node, Screen, resolve_ladder
 from litmus.runner.local_avd import LocalAvd
+from litmus.runner.proxy import MitmProxy
 from litmus.worker import evidence
 from litmus.worker.events import (
     DONE,
@@ -40,7 +72,7 @@ from litmus.worker.events import (
     NullSink,
 )
 from litmus.worker.policy import HeuristicPolicy, StepRecord
-from litmus.worker.verify import AttemptResult, Verification, verify_finding
+from litmus.worker.verify import AttemptResult, ReplayContext, Verification, verify_finding
 
 DEFAULT_WALL_CLOCK_S = 12 * 60
 DEFAULT_SETTLE_CAP_MS = 4000
@@ -75,6 +107,9 @@ class RunOptions:
     artifacts_dir: Path | None = None
     wall_clock_s: int = DEFAULT_WALL_CLOCK_S
     verify: bool = True
+    #: Network detection needs a proxy; the benchmark turns it off only when
+    #: mitmproxy is not installed (the run then lacks http findings, and says so).
+    proxy: bool = True
     #: Supplied by the control plane so the run row, the event stream and the
     #: evidence directory all share one id. Generated when the CLI drives a run.
     run_id: str | None = None
@@ -98,6 +133,7 @@ class RunResult:
     device_info: dict[str, Any] = field(default_factory=dict)
     app_info: dict[str, Any] = field(default_factory=dict)
     bundles: list[evidence.EvidenceBundle] = field(default_factory=list)
+    proxy: dict[str, Any] = field(default_factory=dict)
 
     @property
     def exit_code(self) -> int:
@@ -134,10 +170,33 @@ class Lifecycle:
         self.run_dir = (options.artifacts_dir or self.settings.artifacts_dir) / self.run_id
         self.avd = LocalAvd(self.settings, options.serial)
         self.crash_detector = CrashDetector(self.package)
+        self.anr_detector = AnrDetector(self.package)
+        self.deadtap_detector = DeadTapDetector(self.package)
         self.driver: Driver | None = None
         self.component = ""
+        self.proxy: MitmProxy | None = None
         self._seen_findings: list[Finding] = []
+        self._finding_keys: set[tuple[str, str]] = set()
+        self._warned: set[str] = set()
         self._started_at = datetime.now(UTC)
+        # Detector configuration lives in the profile, never in this module.
+        detectors = self.profile.get("detectors") or {}
+        enabled = {str(name) for name in (detectors.get("enable") or [])}
+        fourxx = detectors.get("http_4xx") or {}
+        self.detectors_enabled = enabled
+        self.network_detector = NetworkDetector(
+            allowed_hosts=[str(host) for host in (self.profile.get("allowed_hosts") or [])],
+            http_4xx=("http_4xx" in enabled),
+            http_4xx_paths=[str(path) for path in (fourxx.get("paths") or ["/api/"])],
+            http_4xx_statuses=[int(code) for code in (fourxx.get("statuses") or [404])],
+        )
+        self.ui_scanner = UIScanner(self.package)
+        self.degraded_hosts: set[str] = set()
+        limits = self.profile.get("limits") or {}
+        #: One screen push (4 s). A transition that starts with a network call -
+        #: login submits before it navigates - gets the longer recovery window.
+        self.settle_ms = int(limits.get("settle_ms") or DEFAULT_SETTLE_CAP_MS)
+        self.settle_recover_ms = int(limits.get("settle_timeout_ms") or 12000)
 
     # -- entry point ------------------------------------------------------
     def run(self) -> RunResult:
@@ -157,6 +216,7 @@ class Lifecycle:
             self.driver = driver
             driver.package = self.package
             self.avd.prepare(driver)
+            self.ui_scanner.density_scale = driver.density_scale()
             result.device_info = self.avd.device_info(driver).to_dict()
             self._emit(
                 "device",
@@ -166,21 +226,37 @@ class Lifecycle:
 
             self._status("installing", package=self.package)
             driver.clear_logcat("crash")
-            self.avd.install(driver, self.options.apk)
+            try:
+                self.avd.install(driver, self.options.apk)
+            except Exception as exc:
+                # An install that fails on this device (ABI mismatch) is an
+                # environment signal: visible in the filtered lane, never a bug.
+                kind = classify_environment(str(exc))
+                if kind:
+                    finding = filtered_finding(
+                        kind,
+                        f"{kind}:{self.package}",
+                        local_id=f"F{len(self._seen_findings) + 1}",
+                        detail=str(exc)[:400],
+                    )
+                    self._seen_findings.append(finding)
+                    result.findings.append(finding)
+                    self._event(FINDING_CANDIDATE, {"finding": finding.to_dict()})
+                raise
             result.app_info = self.avd.app_info(driver, self.package)
             self._emit(
                 "install",
                 f"{self.package} {result.app_info.get('version_name', '?')} installed",
             )
 
+            self._start_proxy(result)
             driver.clear_app(self.package)
             driver.clear_logcat("crash")
             self._status("exploring", step_budget=self.options.steps)
             screen = self._launch_and_wait()
-            steps, finding = self._explore(screen)
+            steps, findings = self._explore(screen)
             result.steps = steps
-            if finding is not None:
-                result.findings.append(finding)
+            result.findings.extend(findings)
 
             if result.findings and self.options.verify:
                 self._status("verifying", findings=len(result.findings))
@@ -199,12 +275,54 @@ class Lifecycle:
             result.error = f"{type(exc).__name__}: {exc}"
             self._warn(result.error, kind="error")
         finally:
+            # The global proxy is cleared here, not in the happy path: a device
+            # left pointing at a dead proxy breaks every later run.
+            self._stop_proxy(result)
             result.duration_s = round(time.monotonic() - started, 2)
             self._write_run_summary(result)
             self._persist(result)
             self._finish(result)
 
         return result
+
+    # -- proxy ------------------------------------------------------------
+    def _start_proxy(self, result: RunResult) -> None:
+        driver = self._driver
+        allowed = [str(host) for host in (self.profile.get("allowed_hosts") or [])]
+        if allowed:
+            self.degraded_hosts = unreachable_hosts(allowed)
+            for host in sorted(self.degraded_hosts):
+                self._warn(
+                    f"backend {host} is not reachable - transport errors are warnings, "
+                    "not HTTP findings"
+                )
+        if not self.options.proxy or "http_5xx" not in self.detectors_enabled:
+            self._emit("proxy", "disabled by options/profile")
+            result.proxy = {"enabled": False}
+            return
+        proxy = MitmProxy(driver, self.run_dir / "proxy")
+        if proxy.start():
+            self.proxy = proxy
+            self._emit("proxy", proxy.status_line())
+            result.proxy = {
+                "enabled": True,
+                "port": proxy.port,
+                "flows": str(proxy.flows_path),
+            }
+        else:
+            result.proxy = {"enabled": False, "error": proxy.error}
+            self._emit("proxy", proxy.status_line())
+            self._warn(f"network detection disabled: {proxy.error}")
+
+    def _stop_proxy(self, result: RunResult) -> None:
+        proxy = self.proxy
+        self.proxy = None
+        if proxy is None:
+            return
+        cleared = proxy.clear_device_proxy()
+        proxy.stop()
+        self._emit("proxy", f"stopped; emulator http_proxy={cleared or 'unset'}")
+        result.proxy = {**result.proxy, "cleared": cleared or "unset"}
 
     def _finish(self, result: RunResult) -> None:
         """Announce that the report is queryable, then close the run."""
@@ -215,6 +333,7 @@ class Lifecycle:
                     "report_url": f"/v1/runs/{self.run_id}/report",
                     "steps": len(result.steps),
                     "confirmations": result.confirmations,
+                    "kinds": sorted({finding.kind for finding in result.findings}),
                 },
             )
         counts = {"confirmed": 0, "flaky": 0, "filtered": 0}
@@ -233,14 +352,24 @@ class Lifecycle:
         )
 
     # -- explore ----------------------------------------------------------
-    def _explore(self, screen: Screen) -> tuple[list[StepRecord], Finding | None]:
+    def _explore(self, screen: Screen) -> tuple[list[StepRecord], list[Finding]]:
         driver = self._driver
         policy = HeuristicPolicy(self.profile, self.package)
         steps: list[StepRecord] = []
-        finding: Finding | None = None
+        findings: list[Finding] = []
         deadline = time.monotonic() + self.options.wall_clock_s
         activity = ""
         activity_hash = ""
+        segment_start = 0
+        scanned: set[str] = {screen.state_hash(self.package)}
+        #: screen hash -> the resource id that first navigated there. After a
+        #: crash this is what must not be tapped again: the crawl would only
+        #: re-enter the same crashing screen and waste the step budget.
+        entry: dict[str, str] = {}
+
+        # A symptom visible on the entry screen (a broken layout on the first
+        # activity) has no step to attach to; it is replayed from the launch.
+        self._scan_ui(screen, step_idx=None, trace_start=segment_start, findings=findings)
 
         for idx in range(self.options.steps):
             if self.cancel_check():
@@ -270,6 +399,12 @@ class Lifecycle:
                 f"{idx + 1:02d}  {action.kind:<8} {action.target[:28]:<28} "
                 f"{action.reason}"
             )
+            tapped = (
+                resolve_ladder(screen, action.selectors, screen.screen_size)
+                if action.kind == "tap"
+                else None
+            )
+            offset = self.proxy.offset() if self.proxy else 0
             error = driver.execute(action, screen, self.component)
             if error:
                 step.result = f"error: {error}"
@@ -285,7 +420,15 @@ class Lifecycle:
                 screen = recovered
                 continue
 
-            settled, after = self._settle(state)
+            settled, after, toast = self._settle(state, watch_toast=action.kind == "tap")
+            if settled is None:
+                # The window was empty for longer than the transition window.
+                # Recover before recording the step: a stale ``state_after``
+                # would make every replay of this trace invalid.
+                recovered = self._wait_for_app(timeout_s=8)
+                if recovered is not None:
+                    settled = recovered
+                    after = recovered.state_hash(self.package)
             step.state_after = after
             event = self._detect_crash(wait_ms=1500 if settled is None else 0)
             if event is not None:
@@ -293,11 +436,53 @@ class Lifecycle:
                 steps.append(step)
                 self._emit("step", f"{line}  -> CRASH {event.signature}")
                 self._event(STEP, self._step_payload(step, state, after))
-                finding = self._finding_from_crash(event, idx, activity)
-                break
+                finding = self._finding_from_crash(
+                    event, idx, activity, segment_start=segment_start
+                )
+                if finding is not None:
+                    findings.append(finding)
+                policy.observe(action, state, after)
+                # Do not walk back into the crash: the app was relaunched, and
+                # the budget is better spent on the rest of the app.
+                policy.avoid(_action_rid(action), entry.get(state, ""))
+                # The crash is recorded; clear it so the next segment does not
+                # attribute this same block to an unrelated tap.
+                driver.clear_logcat("crash")
+                recovered = self._restart_app()
+                if recovered is None:
+                    self._warn("app did not come back after the crash; stopping explore")
+                    break
+                screen = recovered
+                segment_start = idx + 1
+                activity = ""
+                activity_hash = ""
+                continue
+
+            self._detect_network(offset, idx, segment_start, state, findings)
+            # An ANR looks exactly like a dead tap (nothing changes) yet is a
+            # hard signal, so it is classified first; only then is "no effect"
+            # allowed to mean "dead tap".
+            anr = self._detect_anr(idx, segment_start, activity, findings)
+            if not anr:
+                self._detect_no_effect(
+                    action=action,
+                    tapped=tapped,
+                    screen=screen,
+                    settled=settled,
+                    state=state,
+                    after=after,
+                    toast=toast,
+                    offset=offset,
+                    idx=idx,
+                    trace_start=segment_start,
+                    activity=activity,
+                    findings=findings,
+                )
 
             steps.append(step)
             policy.observe(action, state, after)
+            if after and after != state:
+                entry.setdefault(after, _action_rid(action))
             self._emit(
                 "step",
                 f"{line}  -> {'changed' if after != state else 'unchanged'}",
@@ -313,48 +498,289 @@ class Lifecycle:
             else:
                 screen = settled
 
-        return steps, finding
+            new_hash = screen.state_hash(self.package)
+            if new_hash not in scanned:
+                scanned.add(new_hash)
+                self._scan_ui(
+                    screen, step_idx=idx, trace_start=segment_start, findings=findings
+                )
 
-    def _settle(self, before: str) -> tuple[Screen | None, str]:
+        return steps, findings
+
+    def _detect_network(
+        self,
+        offset: int,
+        step_idx: int,
+        trace_start: int,
+        state: str,
+        findings: list[Finding],
+    ) -> None:
+        if self.proxy is None:
+            return
+        flows = self.proxy.flows_since(offset)
+        if not flows:
+            return
+        for event in self.network_detector.detect(flows, self.degraded_hosts):
+            if event.is_finding:
+                self._add_network(event, step_idx, trace_start, state, findings)
+            else:
+                self._network_warning(event)
+
+    def _add_network(
+        self,
+        event: NetworkEvent,
+        step_idx: int,
+        trace_start: int,
+        state: str,
+        findings: list[Finding],
+    ) -> None:
+        if not self._claim(event.kind, event.fingerprint):
+            return
+        finding = self.network_detector.to_finding(
+            event, local_id=f"F{len(self._seen_findings) + 1}", step_idx=step_idx
+        )
+        finding.trace_start = trace_start
+        finding.screen_hash = state
+        self._seen_findings.append(finding)
+        findings.append(finding)
+        self._emit("detect", f"{finding.local_id}  {event.kind}  {event.signature}")
+        self._event(
+            FINDING_CANDIDATE,
+            {
+                "finding": finding.to_dict(),
+                "step_idx": step_idx + 1,
+                "flow": event.flow.to_dict(),
+            },
+        )
+
+    def _network_warning(self, event: NetworkEvent) -> None:
+        """A transport failure is a harness warning, never a bug (PLAN §7)."""
+        key = f"{event.kind}:{event.signature}"
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        if event.kind == "network_error":
+            self._warn(f"mock API not reachable: {event.detail}")
+        else:
+            self._warn(event.detail)
+
+    def _detect_no_effect(
+        self,
+        action,
+        tapped: Node | None,
+        screen: Screen,
+        settled: Screen | None,
+        state: str,
+        after: str,
+        toast: bool,
+        offset: int,
+        idx: int,
+        trace_start: int,
+        activity: str,
+        findings: list[Finding],
+    ) -> None:
+        """Dead tap: only when the tap changed nothing at all (PLAN §7)."""
+        if action.kind != "tap" or tapped is None or settled is None:
+            return
+        if after != state:
+            return
+        # Never judge a tap against a screen that is still transitioning.
+        if not settled.is_rendered(self.package):
+            return
+        node_after = self._node_for_identity(settled, tapped)
+        ime_raised = self._driver.ime_shown()
+        # Only in-scope (app) flows count: a connectivity probe or another
+        # process's TLS failure in the same window is not an effect of the tap.
+        network_activity = bool(
+            self.proxy
+            and app_flows(self.proxy.flows_since(offset), self.network_detector)
+        )
+        observation = TapObservation(
+            rid=tapped.resource_id,
+            label=tapped.label(),
+            clickable=bool(tapped.clickable or tapped.long_clickable),
+            node_present_after=node_after is not None,
+            content_before=node_content_hash(tapped),
+            content_after=node_content_hash(node_after) if node_after else "",
+            nav_before=state,
+            nav_after=after,
+            screen_before=screen_content_hash(screen, self.package),
+            screen_after=screen_content_hash(settled, self.package),
+            ime_raised=ime_raised,
+            toast_seen=toast,
+            network_activity=network_activity,
+        )
+        event = self.deadtap_detector.evaluate(observation)
+        if event is None:
+            return
+        if not self._claim("deadtap", event.fingerprint):
+            return
+        finding = self.deadtap_detector.to_finding(
+            event, local_id=f"F{len(self._seen_findings) + 1}", step_idx=idx
+        )
+        finding.trace_start = trace_start
+        finding.screen_hash = state
+        finding.screen = activity.rsplit("/", 1)[-1] if activity else ""
+        self._seen_findings.append(finding)
+        findings.append(finding)
+        self._emit(
+            "detect", f"{finding.local_id}  deadtap  {finding.signature}  ({event.detail})"
+        )
+        self._event(
+            FINDING_CANDIDATE,
+            {"finding": finding.to_dict(), "step_idx": idx + 1},
+        )
+
+    def _detect_anr(
+        self, step_idx: int, trace_start: int, activity: str, findings: list[Finding]
+    ) -> bool:
+        """Hard logcat signals: ANR, and environment failures (filtered).
+
+        Returns True when a hard ANR was added, which stops the same step from
+        also being classified as a dead tap.
+        """
+        added = False
+        log = self._driver.logcat("main", lines=400)
+        for event in self.anr_detector.detect(log):
+            if not self._claim("anr", event.fingerprint):
+                continue
+            finding = self._finding_from_anr(event, step_idx, activity, trace_start)
+            findings.append(finding)
+            added = True
+        signal = find_environment_signal(log, self.package)
+        if signal is not None:
+            kind, line = signal
+            if self._claim(kind, f"{kind}:{self.package}"):
+                finding = filtered_finding(
+                    kind,
+                    f"{kind}:{self.package}",
+                    local_id=f"F{len(self._seen_findings) + 1}",
+                    detail=line[:400],
+                    step_idx=step_idx,
+                )
+                finding.trace_start = trace_start
+                self._seen_findings.append(finding)
+                findings.append(finding)
+                self._emit("detect", f"{finding.local_id}  {kind}  filtered")
+                self._event(FINDING_CANDIDATE, {"finding": finding.to_dict(), "filtered": True})
+        return added
+
+    def _scan_ui(
+        self,
+        screen: Screen,
+        step_idx: int | None,
+        trace_start: int,
+        findings: list[Finding],
+    ) -> None:
+        if "ui_broken" not in self.detectors_enabled:
+            return
+        for event in self.ui_scanner.scan(screen):
+            if not self._claim("ui_broken", event.fingerprint):
+                continue
+            finding = self.ui_scanner.to_finding(
+                event, local_id=f"F{len(self._seen_findings) + 1}", step_idx=step_idx
+            )
+            finding.trace_start = trace_start
+            finding.screen_hash = screen.state_hash(self.package)
+            if step_idx is None:
+                finding.probe["start_hash"] = finding.screen_hash
+            self._seen_findings.append(finding)
+            findings.append(finding)
+            self._emit("detect", f"{finding.local_id}  ui_broken  {finding.signature}")
+            self._event(
+                FINDING_CANDIDATE,
+                {
+                    "finding": finding.to_dict(),
+                    "step_idx": None if step_idx is None else step_idx + 1,
+                },
+            )
+
+    def _claim(self, kind: str, fingerprint: str) -> bool:
+        """One signature repeated across steps/replays is one finding."""
+        key = (kind, fingerprint)
+        if key in self._finding_keys:
+            return False
+        self._finding_keys.add(key)
+        return True
+
+    def _restart_app(self) -> Screen | None:
+        """Bring the app back after a crash so the crawl can continue."""
+        driver = self._driver
+        driver.force_stop(self.package)
+        driver.hide_ime(force=True)
+        self._emit("recover", "relaunching after the crash")
+        driver.launch(self.component)
+        screen = self._wait_for_app(timeout_s=20)
+        if screen is None:
+            driver.keyevent(4)
+            screen = self._wait_for_app(timeout_s=10)
+        return screen
+
+    @staticmethod
+    def _node_for_identity(after: Screen, before: Node) -> Node | None:
+        """Find the same node on the next dump (resource-id first, then path)."""
+        if before.resource_id:
+            suffix = f":id/{before.resource_id.rsplit('/', 1)[-1]}"
+            for node in after.app_nodes():
+                if node.resource_id.endswith(suffix):
+                    return node
+        for node in after.nodes:
+            if node.path == before.path:
+                return node
+        return None
+
+    def _settle(self, before: str, watch_toast: bool = False) -> tuple[Screen | None, str, bool]:
         """Poll until the screen changes and settles, or the cap expires.
 
-        A transition needs two things before the next action: the new screen
-        must be up (stability across several polls), and - when nothing changes
-        - enough grace that a slow effect is not recorded as "unchanged". Both
-        loops poll; neither sleeps for a fixed span.
+        Two windows, both polled - never slept:
+
+        * ``settle_ms`` (4 s): if the screen is up and unchanged for this long,
+          the action had no visible effect;
+        * ``settle_timeout_ms`` (12 s): a transition that begins with a network
+          call (the login form submits before it navigates) can leave the app
+          window empty for longer than 4 s. Giving up at 4 s would record the
+          old hash as ``state_after`` and every later replay would fail on it.
+
+        While a tap is settling the Toast window is sampled: a Toast is the
+        visible effect of a successful tap that leaves the hierarchy identical.
+        On this AVD the window appears ~1.5-2 s after the tap and lasts ~3 s,
+        so it is sampled for the whole settle window, not just the first second.
         """
         driver = self._driver
         started = time.monotonic()
-        deadline = started + DEFAULT_SETTLE_CAP_MS / 1000
+        soft_deadline = started + self.settle_ms / 1000
+        hard_deadline = started + self.settle_recover_ms / 1000
+        toast_seen = False
         last_screen: Screen | None = None
         last_hash = before
         stable = 0
-        failures = 0
-        while time.monotonic() < deadline:
+        while time.monotonic() < hard_deadline:
+            if watch_toast:
+                toast_seen = driver.toast_visible() or toast_seen
             time.sleep(POLL_INTERVAL_S)
             screen = driver.dump()
             # During a transition the dump can land on the launcher, a system
             # window, or an app window that has not drawn yet. None of those is
-            # a state change worth recording.
+            # a state change worth recording - keep polling, the window is empty.
             if not screen.is_rendered(self.package):
-                failures += 1
-                if failures >= 6:
-                    return None, before
                 continue
-            failures = 0
             current = screen.state_hash(self.package)
             last_screen = screen
+            if current == before:
+                if time.monotonic() >= soft_deadline:
+                    # Unchanged for the whole short window: a dead tap.
+                    return screen, current, toast_seen
+                last_hash = current
+                continue
             if current != last_hash:
                 last_hash = current
-                stable = 0
+                stable = 1
             else:
                 stable += 1
-            if current != before and stable >= 3:
+            if stable >= 3:
                 # The new screen has held for ~1 s: it is safe to act on it.
-                return screen, current
-        # Nothing changed within the cap. Only now is "unchanged" a fact: a
-        # submit that waits on the network can take longer than a screen push.
-        return last_screen, last_hash
+                return screen, current, toast_seen
+        return last_screen, last_hash, toast_seen
 
     def _detect_crash(self, wait_ms: int = 0) -> CrashEvent | None:
         """Read the crash buffer, polling briefly when the app has gone away."""
@@ -369,11 +795,18 @@ class Lifecycle:
             time.sleep(POLL_INTERVAL_S)
 
     def _finding_from_crash(
-        self, event: CrashEvent, step_idx: int, activity: str
-    ) -> Finding:
+        self,
+        event: CrashEvent,
+        step_idx: int,
+        activity: str,
+        segment_start: int = 0,
+    ) -> Finding | None:
+        if not self._claim("crash", event.fingerprint):
+            return None
         finding = self.crash_detector.to_finding(
             event, local_id=f"F{len(self._seen_findings) + 1}", step_idx=step_idx
         )
+        finding.trace_start = segment_start
         self._seen_findings.append(finding)
         if activity:
             finding.screen = activity.rsplit("/", 1)[-1]
@@ -395,18 +828,41 @@ class Lifecycle:
         )
         return finding
 
+    def _finding_from_anr(
+        self, event: AnrEvent, step_idx: int, activity: str, segment_start: int
+    ) -> Finding:
+        finding = self.anr_detector.to_finding(
+            event, local_id=f"F{len(self._seen_findings) + 1}", step_idx=step_idx
+        )
+        finding.trace_start = segment_start
+        finding.screen = activity.rsplit("/", 1)[-1] if activity else ""
+        finding.detail = event.reason or finding.detail
+        self._seen_findings.append(finding)
+        self._emit("detect", f"{finding.local_id}  anr  {finding.signature}")
+        self._event(
+            FINDING_CANDIDATE,
+            {"finding": finding.to_dict(), "step_idx": step_idx + 1},
+        )
+        return finding
+
     # -- verification -----------------------------------------------------
     def _verify(self, result: RunResult) -> None:
         driver = self._driver
         verify_profile = self.profile.get("verify") or {}
         required = int(verify_profile.get("attempts", 3))
         delay_ms = int(verify_profile.get("inter_attempt_delay_ms", 1500))
+        ctx = ReplayContext(
+            proxy=self.proxy,
+            network=self.network_detector,
+            ui=self.ui_scanner,
+            anr=self.anr_detector,
+        )
 
         for finding in result.findings:
             if self.cancel_check():
                 raise RunCancelled("cancelled from the dashboard")
             workdir = self.run_dir / "verification" / finding.local_id
-            self._emit("verify", f"{finding.local_id}  {finding.signature}")
+            self._emit("verify", f"{finding.local_id}  {finding.kind}  {finding.signature}")
             verification = verify_finding(
                 finding=finding,
                 driver=driver,
@@ -418,6 +874,7 @@ class Lifecycle:
                 max_tries=5,
                 settle_cap_ms=DEFAULT_SETTLE_CAP_MS,
                 inter_attempt_delay_ms=delay_ms,
+                ctx=ctx,
                 on_attempt=lambda attempt, finding=finding: self._on_attempt(finding, attempt),
             )
             result.verifications.append(verification)
@@ -457,6 +914,7 @@ class Lifecycle:
                     package=self.package,
                     component=self.component,
                     settle_cap_ms=DEFAULT_SETTLE_CAP_MS,
+                    density_scale=self.ui_scanner.density_scale,
                 )
                 result.bundles.append(bundle)
                 self._emit("evidence", f"bundle {bundle.finding_dir}")
@@ -465,7 +923,7 @@ class Lifecycle:
         if attempt.reproduced:
             detail = "reproduced"
         elif attempt.valid:
-            detail = "valid, not reproduced"
+            detail = f"valid, not reproduced: {attempt.detail or attempt.reason}"
         else:
             detail = f"invalid: {attempt.reason}"
         self._emit("attempt", f"attempt {attempt.attempt}  {detail}  ({attempt.duration_s:.1f}s)")
@@ -478,6 +936,7 @@ class Lifecycle:
                 "valid": attempt.valid,
                 "reproduced": attempt.reproduced,
                 "reason": attempt.reason,
+                "detail": attempt.detail,
                 "duration_s": round(attempt.duration_s, 2),
                 "state_hash": attempt.state_hash,
             },
@@ -562,12 +1021,18 @@ class Lifecycle:
             "steps": [step.to_dict() for step in result.steps],
             "device": result.device_info,
             "app": result.app_info,
+            "proxy": result.proxy,
             "findings": [finding.to_dict() for finding in result.findings],
             "verifications": [item.to_dict() for item in result.verifications],
             "confirmations": result.confirmations,
             "evidence": [bundle.to_dict() for bundle in bundles],
         }
         (self.run_dir / "run.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        flows = load_flows(self.run_dir / "proxy" / "flows.jsonl")
+        if flows:
+            (self.run_dir / "proxy" / "flows.json").write_text(
+                json.dumps([flow.to_dict() for flow in flows], indent=2), encoding="utf-8"
+            )
 
     def _persist(self, result: RunResult) -> None:
         if not self.settings.has_database:
@@ -655,7 +1120,17 @@ class Lifecycle:
             asyncio.run(repo.persist_run(self.settings, record))
             self._emit("db", "run persisted to Postgres")
         except Exception as exc:  # noqa: BLE001 - persistence is best effort
-            self._warn( f"database persistence skipped: {type(exc).__name__}: {exc}")
+            self._warn(f"database persistence skipped: {type(exc).__name__}: {exc}")
+
+
+def _action_rid(action) -> str:
+    """The resource id an action targets, if any (empty for keys/swipes)."""
+    if action is None:
+        return ""
+    for selector in getattr(action, "selectors", []) or []:
+        if selector.get("level") == "resource_id":
+            return str(selector.get("value") or "")
+    return ""
 
 
 def _sha256(path: Path) -> str | None:

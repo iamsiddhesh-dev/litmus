@@ -19,7 +19,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
-from litmus.runner.driver import Node, Screen, selector_ladder
+from litmus.runner.driver import Node, Screen, resolve_ladder, selector_ladder
 
 #: Container classes whose children behave like list rows.
 LIST_CONTAINERS = ("ListView", "RecyclerView")
@@ -108,6 +108,8 @@ class HeuristicPolicy:
         self.back_count = 0
         self.scrolled_states: set[str] = set()
         self.hash_history: list[str] = []
+        #: Resource ids the crawl must stop touching (a path that crashed).
+        self.avoid_rids: set[str] = set()
 
     # -- public API -------------------------------------------------------
     def next_action(
@@ -133,12 +135,15 @@ class HeuristicPolicy:
                 reason="unvisited actionable element",
             )
 
-        # A tap that changed nothing is worth one more try (double-tap bugs).
+        # A tap that changed nothing is worth one more try (double-tap bugs),
+        # but only while its target still resolves to the same control: after a
+        # navigation the old selector can land on whatever now sits there.
         if (
             self.last_action is not None
             and self.last_action.kind == "tap"
             and state_hash == self.last_state_hash
             and self.repeat_count < self.max_repeats
+            and self._target_still_present(screen)
         ):
             return Action(
                 kind="tap",
@@ -176,6 +181,24 @@ class HeuristicPolicy:
         """Stop re-tapping the last action (its selector no longer resolves)."""
         self.repeat_count = self.max_repeats
         self.last_action = None
+
+    def avoid(self, *resource_ids: str) -> None:
+        """Stop touching these controls for the rest of the run.
+
+        Called after a crash: the app has been relaunched, and re-entering the
+        same screen through the same control would just crash again - burning
+        the step budget that the rest of the app needs.
+        """
+        for resource_id in resource_ids:
+            name = str(resource_id or "").rsplit("/", 1)[-1]
+            if name:
+                self.avoid_rids.add(name)
+
+    def _target_still_present(self, screen: Screen) -> bool:
+        if self.last_action is None or not self.last_action.selectors:
+            return False
+        node = resolve_ladder(screen, self.last_action.selectors, screen.screen_size)
+        return node is not None and node.label() == self.last_action.target
 
     @staticmethod
     def _key_of_action(action: Action) -> str:
@@ -288,6 +311,8 @@ class HeuristicPolicy:
         for node in screen.app_nodes(self.package):
             if not node.enabled or not node.has_area:
                 continue
+            if node.resource_id.rsplit("/", 1)[-1] in self.avoid_rids:
+                continue
             if node.clickable or node.long_clickable or node.is_edit_text:
                 candidates.append(node)
         candidates.extend(self._row_candidates(screen))
@@ -302,6 +327,8 @@ class HeuristicPolicy:
                 continue
             for child in node.children:
                 if not child.enabled or not child.has_area:
+                    continue
+                if child.resource_id.rsplit("/", 1)[-1] in self.avoid_rids:
                     continue
                 if is_list or self._looks_like_row(child):
                     rows.append(child)

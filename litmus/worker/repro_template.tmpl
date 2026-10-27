@@ -7,6 +7,13 @@ on the target device. Only the standard library and adb are used.
     python repro.py --serial emulator-5554
 
 Exit code 0: the finding reproduced. 1: it did not.
+
+The check at the end depends on the finding kind:
+
+* crash / anr   - the same fingerprint appears in the logcat buffers;
+* http_5xx/4xx  - the app logs ``<status> <METHOD> <path>`` after the trigger;
+* deadtap       - navigation, screen content and the tapped node stay identical;
+* ui_broken     - the same overlap / zero-size / clipped signature is on screen.
 """
 
 import argparse
@@ -25,6 +32,10 @@ PACKAGE = __PACKAGE__
 COMPONENT = __COMPONENT__
 FINGERPRINT = __FINGERPRINT__
 SETTLE_MS = __SETTLE_MS__
+DENSITY = __DENSITY__
+PROBE = json.loads(r"""
+__PROBE__
+""")
 TRACE = json.loads(r"""
 __TRACE__
 """)
@@ -81,9 +92,12 @@ def walk(root):
     return entries
 
 
+def app_entries(root):
+    return [entry for entry in walk(root) if entry[0].get("package") == PACKAGE]
+
+
 def state_hash(root):
-    entries = walk(root)
-    app = [entry for entry in entries if entry[0].get("package") == PACKAGE]
+    app = app_entries(root)
     scoped = sorted(
         {
             entry[0].get("resource-id")
@@ -126,6 +140,47 @@ def state_hash(root):
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
+def node_content(element):
+    return "|".join(
+        [
+            (element.get("text") or "").strip(),
+            (element.get("content-desc") or "").strip(),
+            "1" if element.get("checked") == "true" else "0",
+            "1" if element.get("selected") == "true" else "0",
+            "1" if element.get("enabled") == "true" else "0",
+        ]
+    )
+
+
+def content_hash(text):
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def screen_content_hash(root):
+    return content_hash("\n".join(
+        (element.get("resource-id") or "") + "|" + node_content(element)
+        for element, _depth, _index, _path in app_entries(root)
+    ))
+
+
+def bounds_of(element):
+    match = BOUNDS_RE.match(element.get("bounds", "") or "")
+    if not match:
+        return None
+    return tuple(int(value) for value in match.groups())
+
+
+def short_rid(element):
+    return (element.get("resource-id") or "").rsplit("/", 1)[-1]
+
+
+def find_short(root, rid):
+    for element, _depth, _index, _path in app_entries(root):
+        if short_rid(element) == rid:
+            return element
+    return None
+
+
 def resolve(root, selectors, size):
     entries = walk(root)
     width, height = size
@@ -162,8 +217,7 @@ def resolve(root, selectors, size):
 
 
 def center(element):
-    match = BOUNDS_RE.match(element.get("bounds", ""))
-    left, top, right, bottom = (int(value) for value in match.groups())
+    left, top, right, bottom = bounds_of(element)
     return (left + right) // 2, (top + bottom) // 2
 
 
@@ -262,6 +316,10 @@ def crash_log():
     return adb("logcat", "-b", "crash", "-d", "-v", "threadtime")
 
 
+def main_log():
+    return adb("logcat", "-b", "main", "-d", "-v", "brief")
+
+
 def wait_for_hash(expected, timeout_ms):
     deadline = time.time() + timeout_ms / 1000.0
     while time.time() < deadline:
@@ -275,9 +333,96 @@ def wait_for_hash(expected, timeout_ms):
 def wait_for_crash(timeout_ms):
     deadline = time.time() + timeout_ms / 1000.0
     while time.time() < deadline:
-        if FINGERPRINT in crash_fingerprints(crash_log()):
+        log = crash_log()
+        if FINGERPRINT in crash_fingerprints(log):
+            return True
+        if KIND == "anr" and "ANR in " + PACKAGE in main_log():
             return True
         time.sleep(0.25)
+    return False
+
+
+def wait_for_http(timeout_ms):
+    """The app logs ``<status> <METHOD> <path>`` for every call (contract §3.1)."""
+    wanted = PROBE.get("signature", SIGNATURE)
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        if wanted in main_log():
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def wait_for_deadtap(timeout_ms):
+    expected = PROBE.get("nav_hash", "")
+    screen_expected = PROBE.get("screen_hash", "")
+    content_expected = PROBE.get("content_hash", "")
+    rid = PROBE.get("rid", "")
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        if ime_shown():
+            return False
+        root = dump()
+        if root is None:
+            return False
+        if expected and state_hash(root) != expected:
+            return False
+        if screen_expected and screen_content_hash(root) != screen_expected:
+            return False
+        element = find_short(root, rid)
+        if element is None:
+            return False
+        if content_expected and content_hash(node_content(element)) != content_expected:
+            return False
+        time.sleep(0.2)
+    return True
+
+
+def wait_for_ui(timeout_ms):
+    """Look for the recorded layout signature on the current screen."""
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        root = dump()
+        if root is not None and ui_signature_present(root):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def ui_signature_present(root):
+    signature = PROBE.get("signature", SIGNATURE)
+    kind, _, value = signature.partition(":")
+    if kind == "overlap":
+        left_rid, _, right_rid = value.partition(",")
+        first, second = find_short(root, left_rid), find_short(root, right_rid)
+        if first is None or second is None:
+            return False
+        a, b = bounds_of(first), bounds_of(second)
+        if a is None or b is None:
+            return False
+        width = min(a[2], b[2]) - max(a[0], b[0])
+        height = min(a[3], b[3]) - max(a[1], b[1])
+        overlap = max(0, width) * max(0, height)
+        return overlap > 8.0 * DENSITY * DENSITY
+    if kind == "zero-size":
+        element = find_short(root, value)
+        bounds = bounds_of(element) if element is not None else None
+        return element is not None and bounds is not None and (
+            (bounds[2] - bounds[0]) * (bounds[3] - bounds[1]) == 0
+        )
+    if kind == "clipped":
+        element = find_short(root, value)
+        bounds = bounds_of(element) if element is not None else None
+        if bounds is None:
+            return False
+        width, height = screen_size()
+        tolerance = int(round(2 * DENSITY))
+        return (
+            bounds[0] < -tolerance
+            or bounds[1] < -tolerance
+            or bounds[2] > width + tolerance
+            or bounds[3] > height + tolerance
+        )
     return False
 
 
@@ -302,10 +447,8 @@ def main():
     shell("am", "start", "-W", "-n", COMPONENT)
     size = screen_size()
 
-    if not TRACE:
-        print("FAIL: trace is empty")
-        return 1
-    if not wait_for_hash(TRACE[0]["state_before"], 12000):
+    start_hash = TRACE[0]["state_before"] if TRACE else PROBE.get("start_hash", "")
+    if start_hash and not wait_for_hash(start_hash, 12000):
         print("FAIL: app did not reach the recorded start screen")
         return 1
 
@@ -327,9 +470,19 @@ def main():
         if not wait_for_hash(step["state_after"], SETTLE_MS):
             print("WARN: step {}: navigation hash did not settle".format(index))
 
-    reproduced = wait_for_crash(SETTLE_MS)
+    if KIND in ("http_5xx", "http_4xx"):
+        reproduced = wait_for_http(SETTLE_MS)
+    elif KIND == "deadtap":
+        reproduced = wait_for_deadtap(SETTLE_MS)
+    elif KIND == "ui_broken":
+        reproduced = wait_for_ui(SETTLE_MS)
+    else:
+        reproduced = wait_for_crash(SETTLE_MS)
+
     with open("repro_logcat.txt", "w", encoding="utf-8") as handle:
         handle.write(crash_log())
+    with open("repro_logcat_main.txt", "w", encoding="utf-8") as handle:
+        handle.write(main_log())
 
     if reproduced:
         print("PASS: {} in {}".format(SIGNATURE, PACKAGE))
