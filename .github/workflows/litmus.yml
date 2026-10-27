@@ -1,14 +1,17 @@
-# Litmus CI sample: trigger a run on a self-hosted runner that has an emulator.
+# Litmus CI: unit tests on every push, a device run only where a device exists.
 #
 # Read this before copying it into a repo:
 #
-#  * GitHub-hosted runners **cannot** run Litmus. Android emulation needs KVM
-#    (Linux) or WHPX/Hyper-V (Windows) and a long-lived AVD, so the job below is
-#    pinned to `self-hosted` labels. If you only have hosted runners, call the
-#    API from a workflow on a machine you do own, and keep this file as the
-#    template.
-#  * The workflow is **API-trigger only**: it never drives adb itself. CI talks
-#    to the Litmus control plane, which owns the device, the proxy and the AVD.
+#  * `unit` runs on a GitHub-hosted runner: lint + the device-free test suite.
+#    It needs no emulator, no secrets and finishes in about a minute.
+#  * `run-test` talks to a Litmus control plane that owns the emulator, proxy
+#    and AVD, so it is pinned to `self-hosted` labels and gated on the
+#    repository variable `LITMUS_DEVICE_CI=true`. A job pinned to a label nobody
+#    registered does not fail, it queues silently, so the gate matters: with the
+#    variable unset the job is skipped, not queued. Register a runner with
+#    `self-hosted, windows, android-emulator` to use it.
+#  * The device job is **API-trigger only**: it never drives adb itself. CI
+#    talks to the control plane, which owns the device.
 #  * Set `LITMUS_API_URL` and (when `API_TOKEN` is set on the server)
 #    `LITMUS_API_TOKEN` as repository secrets. No secret ever appears in a log.
 #  * A run takes minutes, so the job starts it and polls the report endpoint
@@ -32,16 +35,64 @@ on:
         default: "25"
   push:
     branches: [main]
-    paths:
-      - "**.apk"
 
 concurrency:
   group: litmus-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
+  unit:
+    name: lint + unit tests (no device)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Tests
+        # Every test is device-free: the device, proxy and LLM modules are
+        # imported lazily, so the suite runs on a plain runner.
+        #
+        # The tail of the run is copied into the step summary on purpose: a
+        # failed job's log needs an authenticated download, the summary does not,
+        # so a red build explains itself to anyone who opens the run page.
+        shell: pwsh
+        run: |
+          python -m pytest -q --tb=short *> pytest.log
+          $code = $LASTEXITCODE
+          $tail = Get-Content pytest.log -Tail 60
+          $tail | Out-Host
+          if ($code -ne 0) {
+            # Annotations and the step summary are readable without an
+            # authenticated log download, so a red build explains itself.
+            $tail | Select-String -Pattern '^FAILED\s' | Select-Object -First 10 | ForEach-Object {
+              Write-Output "::error::$($_.Line)"
+            }
+            '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+            $tail | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+            '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          }
+          exit $code
+
   run-test:
-    # A hosted runner has no emulator: keep this self-hosted.
+    name: litmus run on a device (self-hosted)
+    # Skipped unless a runner with these labels exists and the repo opts in.
+    if: vars.LITMUS_DEVICE_CI == 'true'
     runs-on: [self-hosted, windows, android-emulator]
     timeout-minutes: 45
     env:

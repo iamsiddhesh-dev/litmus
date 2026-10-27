@@ -129,6 +129,38 @@ async def test_create_run_persists_queued_event_before_dispatch(client, monkeypa
     assert calls and calls[0]["run_id"] == run_id
 
 
+async def test_create_run_picks_the_profile_from_the_package(client, monkeypatch) -> None:
+    """An APK uploaded from the dashboard has no profile: the package decides."""
+    http, store = client
+    store.targets["tgt_1"]["profile"] = ""
+    calls: list[dict] = []
+
+    async def fake_enqueue(**kwargs):
+        calls.append(kwargs)
+        return "inline"
+
+    monkeypatch.setattr("litmus.api.routes.runs.enqueue_run", fake_enqueue)
+    response = await http.post("/v1/runs", json={"target_id": "tgt_1"})
+    assert response.status_code == 202
+    assert calls[0]["profile"] == "bazaar"
+
+
+async def test_create_run_falls_back_to_generic_for_an_unknown_package(client, monkeypatch) -> None:
+    http, store = client
+    store.targets["tgt_1"]["profile"] = ""
+    store.targets["tgt_1"]["package"] = "com.example.nothing"
+    calls: list[dict] = []
+
+    async def fake_enqueue(**kwargs):
+        calls.append(kwargs)
+        return "inline"
+
+    monkeypatch.setattr("litmus.api.routes.runs.enqueue_run", fake_enqueue)
+    response = await http.post("/v1/runs", json={"target_id": "tgt_1"})
+    assert response.status_code == 202
+    assert calls[0]["profile"] == "generic"
+
+
 async def test_run_detail_reports_counts(client) -> None:
     http, store = client
     store.runs["run_1"] = {

@@ -10,6 +10,7 @@ from litmus.doctor import (
     Status,
     _check_disk,
     _check_python,
+    _check_redis,
     doctor_exit_code,
 )
 
@@ -40,6 +41,33 @@ def test_disk_check_reports_free_space() -> None:
     check = _check_disk(settings)
     assert check.status in (Status.PASS, Status.FAIL)
     assert "GB free" in check.detail
+
+
+async def test_redis_down_warns_instead_of_failing(monkeypatch) -> None:
+    """Redis is an accelerator: without it the API runs lifecycles in-process."""
+    import redis.asyncio as redis_asyncio
+
+    class Unreachable:
+        async def ping(self):
+            raise ConnectionError("Error 22 connecting to 127.0.0.1:6379")
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(redis_asyncio, "from_url", lambda *a, **k: Unreachable())
+    settings = Settings(redis_url="redis://127.0.0.1:6379")
+    check = await _check_redis(settings)
+    assert check.status is Status.WARN, check.detail
+    assert check.required is False
+    # A developer without Redis can still drive the dashboard and the CLI.
+    assert doctor_exit_code([Check("python", Status.PASS, "ok"), check]) == 0
+
+
+async def test_redis_missing_url_warns_not_fails() -> None:
+    settings = Settings(redis_url="")
+    check = await _check_redis(settings)
+    assert check.status is Status.WARN
+    assert "in-process" in check.detail
 
 
 def test_postgres_dsn_strips_sqlalchemy_driver_prefix() -> None:

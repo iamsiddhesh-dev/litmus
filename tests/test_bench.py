@@ -175,11 +175,53 @@ def test_results_directory_is_under_benchmark():
     assert bench.RESULTS_DIR == REPO_ROOT / "benchmark" / "results"
 
 
-def test_fixture_apk_resolves_from_the_repo_root():
+def _fixture_apk_on_disk() -> bool:
+    """True when the fixture's *local* APK exists. Never touches the network."""
+    try:
+        local = (bench.load_fixture("bazaar").get("apk") or {}).get("local")
+    except FileNotFoundError:
+        return False
+    if not local:
+        return False
+    candidate = Path(local)
+    if not candidate.is_absolute():
+        candidate = (bench.REPO_ROOT / candidate).resolve()
+    return candidate.is_file()
+
+
+@pytest.mark.skipif(
+    not _fixture_apk_on_disk(),
+    reason="fixture checkout is not on this machine (E:\\bazaar); the APK is a fixture dependency",
+)
+def test_the_bazaar_fixture_apk_is_available_on_this_machine():
     fixture = bench.load_fixture("bazaar")
     apk = bench.resolve_apk(fixture)
     assert apk.is_file(), apk
     assert apk.name == "app-debug.apk"
+
+
+def test_a_local_apk_wins_over_the_release_url(tmp_path, monkeypatch):
+    """Resolution is local-path-first, and the path is relative to the repo root."""
+    apk = tmp_path / "app-debug.apk"
+    apk.write_bytes(b"PK\x03\x04 local build")
+    monkeypatch.setattr(bench, "REPO_ROOT", tmp_path)
+    fixture = {
+        "name": "bazaar",
+        "apk": {"local": "app-debug.apk", "url": "https://invalid.test/x.apk"},
+    }
+    assert bench.resolve_apk(fixture) == apk.resolve()
+
+
+def test_a_fixture_with_neither_path_nor_url_fails_loudly(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench, "REPO_ROOT", tmp_path)
+    with pytest.raises(FileNotFoundError):
+        bench.resolve_apk({"name": "nowhere", "apk": {}})
+
+
+def test_the_bazaar_fixture_declares_both_a_path_and_a_url():
+    apk = bench.load_fixture("bazaar")["apk"]
+    assert apk["local"].endswith("app-debug.apk")
+    assert apk["url"].startswith("https://")
 
 
 @pytest.mark.parametrize("kind", ["crash", "http_5xx", "deadtap", "ui_broken"])

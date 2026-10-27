@@ -60,19 +60,7 @@
             <span>APK</span>
             <input id="apk" name="apk" type="file" accept=".apk,application/vnd.android.package-archive" required>
           </label>
-          <div class="row-2">
-            <label class="field">
-              <span>Profile</span>
-              <select id="profile" name="profile">
-                <option value="bazaar">bazaar</option>
-                <option value="generic">generic</option>
-              </select>
-            </label>
-            <label class="field">
-              <span>Steps</span>
-              <input id="steps" name="steps" type="number" min="1" max="200" value="25">
-            </label>
-          </div>
+          <p class="field-hint">Litmus installs it, crawls 25 steps, and drives it with the profile for its package.</p>
           <label class="checkbox mb-2" style="margin:4px 0 10px">
             <input id="verify" name="verify" type="checkbox" checked>
             replay every finding 3×

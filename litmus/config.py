@@ -35,7 +35,6 @@ class Settings(BaseSettings):
 
     # Runtime
     artifacts_dir: Path = Field(default=REPO_ROOT / "artifacts")
-    runner_kind: str = "local_avd"
     api_token: str = ""
     log_level: str = "INFO"
     #: Single tenant, no auth: loopback only (PLAN §1.2, §10).
@@ -44,11 +43,6 @@ class Settings(BaseSettings):
 
     # Integrations
     slack_webhook_url: str = ""
-    linear_api_key: str = ""
-    linear_team_id: str = ""
-    langfuse_public_key: str = ""
-    langfuse_secret_key: str = ""
-    sentry_dsn: str = ""
 
     @property
     def has_database(self) -> bool:

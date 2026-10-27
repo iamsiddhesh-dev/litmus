@@ -185,21 +185,38 @@ async def _check_postgres(settings: Settings) -> Check:
 
 
 async def _check_redis(settings: Settings) -> Check:
+    """Redis is an accelerator, not a requirement.
+
+    With Redis down the API runs one lifecycle in-process (the documented
+    single-process dev fallback), so an unreachable Redis is a warning: a
+    developer without Redis can still drive the dashboard and the CLI.
+    """
     if not settings.has_redis:
         return Check(
             "redis",
-            Status.FAIL,
-            "REDIS_URL not set - copy .env.example to .env and fill it in",
+            Status.WARN,
+            "REDIS_URL not set - the API will run lifecycles in-process",
+            required=False,
         )
     try:
         import redis.asyncio as redis
     except ImportError:
-        return Check("redis", Status.FAIL, "redis package is not installed")
+        return Check(
+            "redis",
+            Status.WARN,
+            "redis package is not installed - in-process fallback",
+            required=False,
+        )
     client = redis.from_url(settings.redis_url, socket_connect_timeout=10)
     try:
         pong = await client.ping()
     except Exception as exc:  # noqa: BLE001
-        return Check("redis", Status.FAIL, f"unreachable: {type(exc).__name__}: {exc}")
+        return Check(
+            "redis",
+            Status.WARN,
+            f"unreachable: {type(exc).__name__}: {exc} - the API will run lifecycles in-process",
+            required=False,
+        )
     finally:
         await client.aclose()
     return Check("redis", Status.PASS, "PING ok" if pong else "PING returned falsy")

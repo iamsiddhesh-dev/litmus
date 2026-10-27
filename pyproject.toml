@@ -53,7 +53,7 @@ mcp = [
 mqa = "litmus.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/<owner>/litmus"
+Homepage = "https://github.com/iamsiddhesh-dev/litmus"
 
 [tool.setuptools.packages.find]
 include = ["litmus*"]

@@ -483,6 +483,11 @@
         // A finished run needs no live tail; the report is the whole story.
         if (["done", "failed", "cancelled"].includes(data.run.status)) {
           state.closed = true;
+          setPhase(data.run.status);
+          // A run started from the CLI or the benchmark may have no event rows
+          // to replay, so the stream never fires `done`: load the report here
+          // rather than showing "no finding yet" for a run that has findings.
+          if (!state.reportLoaded) await loadReport();
         }
       }
     } catch (_) {
@@ -506,13 +511,12 @@
     try {
       const form = new FormData();
       form.append("file", file);
-      form.append("profile", $("profile").value);
       const target = await api("/v1/targets", { method: "POST", body: form });
       status.textContent = `target ${target.id} · ${target.package || "unknown package"}`;
+      // No profile or step budget from the UI: the API picks the profile from
+      // the package (litmus/profiles.py) and defaults to a 25-step crawl.
       const body = {
         target_id: target.id,
-        profile: $("profile").value,
-        steps: Number($("steps").value) || 25,
         verify: $("verify").checked,
       };
       const created = await api("/v1/runs", {

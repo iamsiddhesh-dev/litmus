@@ -30,5 +30,8 @@ Results are written under `benchmark/results/`.
 
 ## Fixture repo
 
-Bazaar source, contract, and APK releases live in the **bazaar** GitHub repository
-(link in README once published). Mock API must be running for network scenarios.
+Bazaar source, contract, and the `v1.0.3` APK release live at
+[`iamsiddhesh-dev/bazaar`](https://github.com/iamsiddhesh-dev/bazaar). Clone it
+next to this repo (`git clone https://github.com/iamsiddhesh-dev/bazaar ../bazaar`)
+so the mock API is available; `fixtures/bazaar.yaml` otherwise downloads the APK
+from the release. Mock API must be running for network scenarios.

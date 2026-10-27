@@ -22,9 +22,10 @@ artifacts/
 
 # Scratch build of the patched demo app (see demo/build_fixed_apk.ps1).
 /demo/.fixed-src/
-/demo/video/node_modules/
-/demo/video/out/
-/demo/video/public/
+# The demo video: Remotion project, captures and the 8 MB render stay local.
+# The repo ships the evidence and the commands that reproduce it, not footage.
+/demo/video/
+/demo/litmus-demo.mp4
 
 # IDE
 .idea/

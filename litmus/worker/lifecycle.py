@@ -1141,7 +1141,13 @@ class Lifecycle:
             asyncio.run(repo.persist_run(self.settings, record))
             self._emit("db", "run persisted to Postgres")
         except Exception as exc:  # noqa: BLE001 - persistence is best effort
-            self._warn(f"database persistence skipped: {type(exc).__name__}: {exc}")
+            # Not a failure: the evidence bundle on disk is the deliverable, and
+            # a CLI run works without a database. Say what was skipped and why,
+            # so the line does not read like a crash.
+            self._warn(
+                "not persisted to Postgres (evidence on disk is complete): "
+                f"{type(exc).__name__}: {exc} - set DATABASE_URL to keep runs in the dashboard"
+            )
 
 
 def _action_rid(action) -> str:

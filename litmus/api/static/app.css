@@ -183,6 +183,15 @@ a:hover { text-decoration: underline; }
 
 .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 
+/* One line under the APK input explains what the platform will do with it, so
+   the form needs no profile or budget controls the user could not evaluate. */
+.field-hint {
+  margin: -2px 0 10px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--dim);
+}
+
 /* ---- run list -------------------------------------------------------- */
 .run-list { list-style: none; margin: 0; padding: 6px; }
 .run-item {

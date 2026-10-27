@@ -19,6 +19,7 @@ from litmus.api.report import build_report
 from litmus.api.sse import SSE_MEDIA_TYPE, TERMINAL, event_stream
 from litmus.config import Settings
 from litmus.db.store import Store
+from litmus.profiles import profile_for_package
 from litmus.worker.events import RUN_STATUS
 
 router = APIRouter(prefix="/v1/runs", tags=["runs"])
@@ -56,7 +57,12 @@ async def create_run(
     if not apk or not Path(apk).is_file():
         raise HTTPException(status_code=400, detail="target has no readable APK on disk")
 
-    profile = body.profile or target.get("profile") or "generic"
+    profile = (
+        body.profile
+        or target.get("profile")
+        or profile_for_package(target.get("package"))
+        or "generic"
+    )
     run_id = new_run_id()
     run = await store.create_run(
         {
