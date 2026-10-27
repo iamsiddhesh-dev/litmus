@@ -533,7 +533,22 @@ class Driver:
             return ""
 
     def is_booted(self) -> bool:
-        return self.getprop("sys.boot_completed").strip() == "1"
+        """True when Android is up *and* answering commands.
+
+        ``sys.boot_completed`` flips while the package manager is still
+        scanning on a SwiftShader AVD; the first ``am start`` after that then
+        blocks past its timeout. Requiring the boot animation to be finished
+        and a cheap ``pm`` call to answer closes that window.
+        """
+        if self.getprop("sys.boot_completed").strip() != "1":
+            return False
+        if self.getprop("init.svc.bootanim").strip() == "running":
+            return False
+        try:
+            self.shell("pm", "path", "android", timeout=15)
+        except AdbError:
+            return False
+        return True
 
     def current_activity(self) -> str:
         """Best-effort foreground activity, e.g. ``com.bazaar.demo/.ProductActivity``."""

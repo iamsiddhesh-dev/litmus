@@ -22,6 +22,11 @@ dependencies = [
     "asyncpg>=0.29",
     "redis>=5.0",
     "arq>=0.25",
+    # Control plane (M2): REST + SSE dashboard, no frontend build step.
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]
@@ -29,9 +34,6 @@ dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
-    # Needed to run the fixture's mock backend during acceptance runs.
-    "fastapi>=0.110",
-    "uvicorn>=0.30",
 ]
 runner = [
     "uiautomator2>=3.2",
@@ -65,3 +67,14 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency markers are evaluated once at import time, which is
+# exactly what B008 is meant to catch for ordinary defaults.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Header",
+    "fastapi.Query",
+]

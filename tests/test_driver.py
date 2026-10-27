@@ -5,6 +5,8 @@ from __future__ import annotations
 from conftest import login_spec, make_xml, screen_of
 
 from litmus.runner.driver import (
+    AdbError,
+    Driver,
     parse_hierarchy,
     resolve_ladder,
     resolve_selector,
@@ -162,3 +164,38 @@ def test_status_bar_clock_does_not_break_hashing() -> None:
     first = make_xml(spec)
     second = first.replace("12:00", "12:01")
     assert parse_hierarchy(first).state_hash() == parse_hierarchy(second).state_hash()
+class _BootProbe(Driver):
+    """Driver with stubbed adb, for the readiness probe only."""
+
+    def __init__(self, props: dict, pm_responsive: bool = True) -> None:
+        self.props = props
+        self.pm_responsive = pm_responsive
+
+    def getprop(self, name: str) -> str:
+        return self.props.get(name, "")
+
+    def shell(self, *args: str, timeout: int | None = None, check: bool = True) -> str:
+        if args[:2] == ("pm", "path"):
+            if not self.pm_responsive:
+                raise AdbError("adb timed out: shell pm path android")
+            return "package:/system/framework/framework-res.apk"
+        return ""
+
+
+def test_booted_requires_a_finished_boot_animation() -> None:
+    props = {"sys.boot_completed": "1", "init.svc.bootanim": "running"}
+    assert _BootProbe(props).is_booted() is False
+
+
+def test_booted_requires_the_package_manager_to_answer() -> None:
+    props = {"sys.boot_completed": "1", "init.svc.bootanim": "stopped"}
+    assert _BootProbe(props, pm_responsive=False).is_booted() is False
+
+
+def test_booted_when_android_is_up_and_responsive() -> None:
+    props = {"sys.boot_completed": "1", "init.svc.bootanim": "stopped"}
+    assert _BootProbe(props).is_booted() is True
+
+
+def test_not_booted_before_boot_completed() -> None:
+    assert _BootProbe({"init.svc.bootanim": "stopped"}).is_booted() is False

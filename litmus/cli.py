@@ -73,6 +73,7 @@ def run(
 
     _COLORS = {
         "run": "cyan",
+        "status": "cyan",
         "device": "cyan",
         "install": "cyan",
         "launch": "cyan",

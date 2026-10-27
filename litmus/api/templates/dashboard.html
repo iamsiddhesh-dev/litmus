@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Litmus — control plane</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">litmus</span>
+        <span class="brand-sub">a litmus test for mobile bugs</span>
+      </div>
+      <div class="topbar-spacer"></div>
+      <div class="health" id="health">
+        <span id="health-db"><span class="dot"></span>db</span>
+        <span id="health-redis"><span class="dot"></span>redis</span>
+        <span id="health-worker"><span class="dot"></span>worker</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <!-- pane 1: runs -->
+      <section class="pane" id="pane-runs">
+        <div class="pane-head">
+          <span class="pane-title">Runs</span>
+          <span class="pane-count" id="run-count">{{ runs | length }}</span>
+          <div class="pane-actions">
+            <button class="btn btn-ghost" id="refresh-runs" type="button">refresh</button>
+          </div>
+        </div>
+        <div class="pane-body" id="runs-body">
+          <ul class="run-list" id="run-list">
+            {% for run in runs %}
+            <li class="run-item{% if run.id == selected_run %} is-active{% endif %}" data-run-id="{{ run.id }}">
+              <span class="run-dot {{ run.status }}"></span>
+              <span class="run-main">
+                <span class="run-pkg">{{ run.package or 'unknown package' }}</span>
+                <span class="run-meta">{{ run.id }}</span>
+              </span>
+              {% if run.confirmed %}<span class="run-confirmed">{{ run.confirmed }}</span>{% endif %}
+            </li>
+            {% endfor %}
+          </ul>
+          {% if not runs %}
+          <div class="placeholder" id="runs-empty">
+            <strong>No runs yet</strong>
+            <span>Upload an APK below. Litmus installs it, explores it, replays every candidate 3× and reports what survives.</span>
+          </div>
+          {% endif %}
+        </div>
+        <form class="pane-foot" id="run-form">
+          <label class="field">
+            <span>APK</span>
+            <input id="apk" name="apk" type="file" accept=".apk,application/vnd.android.package-archive" required>
+          </label>
+          <div class="row-2">
+            <label class="field">
+              <span>Profile</span>
+              <select id="profile" name="profile">
+                <option value="bazaar">bazaar</option>
+                <option value="generic">generic</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Steps</span>
+              <input id="steps" name="steps" type="number" min="1" max="200" value="25">
+            </label>
+          </div>
+          <label class="checkbox mb-2" style="margin:4px 0 10px">
+            <input id="verify" name="verify" type="checkbox" checked>
+            replay every finding 3×
+          </label>
+          <button class="btn btn-primary" id="start-run" type="submit" style="width:100%">
+            Upload &amp; start run
+          </button>
+          <p class="run-meta" id="form-status" style="margin:8px 0 0"></p>
+        </form>
+      </section>
+
+      <!-- pane 2: live steps -->
+      <section class="pane" id="pane-stream">
+        <div class="pane-head">
+          <span class="pane-title">Live steps</span>
+          <span class="pane-count" id="step-count">0</span>
+          <div class="pane-actions">
+            <label class="checkbox" title="Follow the newest step">
+              <input id="autoscroll" type="checkbox" checked> follow
+            </label>
+            <button class="btn btn-ghost" id="open-report" type="button" disabled>report</button>
+          </div>
+        </div>
+        <div class="stepper" id="stepper"></div>
+        <div class="pane-body" id="feed-body">
+          <div class="placeholder" id="feed-empty">
+            <strong>Nothing streaming</strong>
+            <span>Select a run on the left, or start a new one. Steps appear here as the worker drives the device.</span>
+          </div>
+          <div class="feed" id="feed"></div>
+        </div>
+      </section>
+
+      <!-- pane 3: findings / report -->
+      <section class="pane" id="pane-report">
+        <div class="pane-head">
+          <span class="pane-title">Findings</span>
+          <span class="pane-count" id="finding-count">0</span>
+          <div class="pane-actions">
+            <a class="btn btn-ghost" id="report-json" href="#" target="_blank" rel="noopener" hidden>
+              report.json
+            </a>
+          </div>
+        </div>
+        <div class="pane-body" id="report-body">
+          <div class="placeholder" id="report-empty">
+            <strong>No finding yet</strong>
+            <span>A candidate is shown the moment it is observed; it only reaches the report after three clean-state replays.</span>
+          </div>
+          <div class="report" id="report"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    window.LITMUS_BOOTSTRAP = {{ bootstrap | tojson }};
+  </script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

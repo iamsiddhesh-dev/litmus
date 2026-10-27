@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     runner_kind: str = "local_avd"
     api_token: str = ""
     log_level: str = "INFO"
+    #: Single tenant, no auth: loopback only (PLAN §1.2, §10).
+    api_host: str = "127.0.0.1"
+    api_port: int = 8000
 
     # Integrations
     slack_webhook_url: str = ""
