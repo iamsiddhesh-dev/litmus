@@ -44,6 +44,10 @@ proxy = [
 llm = [
     "litellm>=1.44",
 ]
+mcp = [
+    # run_test / get_run / get_report for an agent or an IDE (PLAN §15).
+    "fastmcp>=2.0",
+]
 
 [project.scripts]
 mqa = "litmus.cli:app"

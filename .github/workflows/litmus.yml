@@ -1,0 +1,128 @@
+# Litmus CI sample: trigger a run on a self-hosted runner that has an emulator.
+#
+# Read this before copying it into a repo:
+#
+#  * GitHub-hosted runners **cannot** run Litmus. Android emulation needs KVM
+#    (Linux) or WHPX/Hyper-V (Windows) and a long-lived AVD, so the job below is
+#    pinned to `self-hosted` labels. If you only have hosted runners, call the
+#    API from a workflow on a machine you do own, and keep this file as the
+#    template.
+#  * The workflow is **API-trigger only**: it never drives adb itself. CI talks
+#    to the Litmus control plane, which owns the device, the proxy and the AVD.
+#  * Set `LITMUS_API_URL` and (when `API_TOKEN` is set on the server)
+#    `LITMUS_API_TOKEN` as repository secrets. No secret ever appears in a log.
+#  * A run takes minutes, so the job starts it and polls the report endpoint
+#    until the run is terminal.
+name: litmus
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_path:
+        description: Path to the APK on the runner (or an artifact path)
+        required: true
+        default: artifacts/app-debug.apk
+      profile:
+        description: Litmus profile name
+        required: false
+        default: bazaar
+      steps:
+        description: Explore step budget
+        required: false
+        default: "25"
+  push:
+    branches: [main]
+    paths:
+      - "**.apk"
+
+concurrency:
+  group: litmus-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  run-test:
+    # A hosted runner has no emulator: keep this self-hosted.
+    runs-on: [self-hosted, windows, android-emulator]
+    timeout-minutes: 45
+    env:
+      LITMUS_API_URL: ${{ secrets.LITMUS_API_URL }}
+      LITMUS_API_TOKEN: ${{ secrets.LITMUS_API_TOKEN }}
+      APK_PATH: ${{ inputs.apk_path || 'artifacts/app-debug.apk' }}
+      PROFILE: ${{ inputs.profile || 'bazaar' }}
+      STEPS: ${{ inputs.steps || '25' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the control plane is up
+        shell: pwsh
+        run: |
+          $health = Invoke-RestMethod -Uri "$env:LITMUS_API_URL/health" -TimeoutSec 10
+          if (-not $health.ok) { throw "Litmus API is not healthy" }
+
+      - name: Upload the APK as a target
+        id: target
+        shell: pwsh
+        run: |
+          $headers = @{}
+          if ($env:LITMUS_API_TOKEN) { $headers["X-Litmus-Token"] = $env:LITMUS_API_TOKEN }
+          $form = @{
+            file    = Get-Item $env:APK_PATH
+            profile = $env:PROFILE
+          }
+          $target = Invoke-RestMethod -Method Post -Uri "$env:LITMUS_API_URL/v1/targets" `
+            -Headers $headers -Form $form -TimeoutSec 300
+          "target_id=$($target.id)" >> $env:GITHUB_OUTPUT
+
+      - name: Start the run
+        id: run
+        shell: pwsh
+        run: |
+          $headers = @{ "Content-Type" = "application/json" }
+          if ($env:LITMUS_API_TOKEN) { $headers["X-Litmus-Token"] = $env:LITMUS_API_TOKEN }
+          $body = @{
+            target_id = "${{ steps.target.outputs.target_id }}"
+            profile   = $env:PROFILE
+            steps     = [int]$env:STEPS
+            verify    = $true
+          } | ConvertTo-Json
+          $run = Invoke-RestMethod -Method Post -Uri "$env:LITMUS_API_URL/v1/runs" `
+            -Headers $headers -Body $body -TimeoutSec 60
+          "run_id=$($run.run.id)" >> $env:GITHUB_OUTPUT
+
+      - name: Wait for the verdict
+        shell: pwsh
+        run: |
+          $headers = @{}
+          if ($env:LITMUS_API_TOKEN) { $headers["X-Litmus-Token"] = $env:LITMUS_API_TOKEN }
+          $url = "$env:LITMUS_API_URL/v1/runs/${{ steps.run.outputs.run_id }}"
+          $terminal = @("done", "failed", "cancelled")
+          for ($i = 0; $i -lt 120; $i++) {
+            $state = Invoke-RestMethod -Uri $url -Headers $headers -TimeoutSec 30
+            Write-Host "status: $($state.run.status)"
+            if ($terminal -contains $state.run.status) { break }
+            Start-Sleep -Seconds 15
+          }
+          if ($state.run.status -ne "done") { throw "run did not finish: $($state.run.status)" }
+
+      - name: Fail the job when a bug was confirmed
+        shell: pwsh
+        run: |
+          $headers = @{}
+          if ($env:LITMUS_API_TOKEN) { $headers["X-Litmus-Token"] = $env:LITMUS_API_TOKEN }
+          $report = Invoke-RestMethod `
+            -Uri "$env:LITMUS_API_URL/v1/runs/${{ steps.run.outputs.run_id }}/report" `
+            -Headers $headers -TimeoutSec 60
+          $confirmed = @($report.findings | Where-Object { $_.verdict -eq "confirmed" })
+          $confirmed | ForEach-Object { Write-Host "$($_.kind)  $($_.signature)" }
+          Write-Host "confirmed: $($confirmed.Count)"
+          if ($confirmed.Count -gt 0) {
+            # A red build is the point of the gate: the app failed its litmus test.
+            throw "$($confirmed.Count) confirmed finding(s) - see the report URL in the summary"
+          }
+
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          $url = "$env:LITMUS_API_URL/runs/${{ steps.run.outputs.run_id }}"
+          "Litmus report: $url" >> $env:GITHUB_STEP_SUMMARY

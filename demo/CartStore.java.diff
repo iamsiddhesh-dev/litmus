@@ -1,0 +1,35 @@
+﻿Fix B1 in a *copy* of the Bazaar fixture (E:\bazaar stays read-only).
+
+The defect: `CartStore.add()` never sets `qty` on the entry it inserts, then
+increments the *previous* entry's quantity. The second add of the same product
+unboxes a null `Integer` and throws
+`java.lang.NullPointerException: Integer.intValue`.
+
+Apply from the fixture root with `git apply -p1 demo/CartStore.java.diff`, or let
+`demo/build_fixed_apk.ps1` do the copy+patch+build.
+
+diff --git a/app/src/main/java/com/bazaar/demo/CartStore.java b/app/src/main/java/com/bazaar/demo/CartStore.java
+index 70f42d6..f7abbf5 100644
+--- a/app/src/main/java/com/bazaar/demo/CartStore.java
++++ b/app/src/main/java/com/bazaar/demo/CartStore.java
+@@ -31,17 +31,18 @@ public final class CartStore {
+ 
+     public static void add(Product p) {
+         Entry existing = findById(p.id);
+ 
+         Entry e = new Entry();
+         e.product = p;
+-        // qty is intentionally left null here; syncWithServer() was meant to set it.
++        e.qty = 1; // every new cart entry starts at one
+         ITEMS.add(e);
+ 
+         if (existing != null) {
+-            existing.qty = existing.qty + 1; // B1: NullPointerException on 2nd add
++            int previous = existing.qty == null ? 0 : existing.qty;
++            existing.qty = previous + 1; // null-safe: fixed B1
+         }
+     }
+ 
+     private static Entry findById(String id) {
+         for (Entry e : ITEMS) {
+             if (e.product.id.equals(id)) return e;

@@ -20,6 +20,12 @@ build/
 artifacts/
 *.log
 
+# Scratch build of the patched demo app (see demo/build_fixed_apk.ps1).
+/demo/.fixed-src/
+/demo/video/node_modules/
+/demo/video/out/
+/demo/video/public/
+
 # IDE
 .idea/
 .vscode/

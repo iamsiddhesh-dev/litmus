@@ -350,7 +350,28 @@ class Lifecycle:
                 **counts,
             },
         )
+        self._notify_slack(result, counts)
 
+    def _notify_slack(self, result: RunResult, counts: dict[str, int]) -> None:
+        """Fire-and-forget Slack ping (PLAN §15).
+
+        The verdict is already persisted and on the event stream, so this can
+        never change the outcome: no webhook means no thread at all, and the
+        POST runs on a daemon thread with its own timeout.
+        """
+        from litmus.services.notify import notify_done_async
+
+        notify_done_async(
+            self.settings,
+            {
+                "run_id": result.run_id,
+                "status": result.status,
+                "package": self.package,
+                "duration_s": result.duration_s,
+                **counts,
+                "kinds": sorted({finding.kind for finding in result.findings}),
+            },
+        )
     # -- explore ----------------------------------------------------------
     def _explore(self, screen: Screen) -> tuple[list[StepRecord], list[Finding]]:
         driver = self._driver

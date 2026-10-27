@@ -171,15 +171,65 @@ def bench(
 
 @app.command()
 def verify_fix(
-    finding: str = typer.Option(..., "--finding", help="Finding id to re-verify."),
+    finding: str = typer.Option(
+        ...,
+        "--finding",
+        help="Finding to re-verify: F2, or <run_id>:F2.",
+    ),
     apk: str = typer.Option(..., "--apk", help="Path to the fixed APK."),
+    run: str = typer.Option(
+        None, "--run", help="Run id (or run.json path) the finding came from."
+    ),
+    attempts: int = typer.Option(3, "--attempts", help="Clean replays required."),
+    serial: str = typer.Option(None, "--serial", help="adb serial."),
+    json_out: bool = typer.Option(False, "--json", help="Emit the verdict as JSON."),
 ) -> None:
-    """Replay a saved finding trace against a fixed APK (available from M4)."""
-    typer.secho(
-        f"mqa verify-fix is not implemented yet - finding={finding} apk={apk}. It lands in M4.",
-        fg="yellow",
-    )
-    raise typer.Exit(code=2)
+    """Prove a fix: replay a saved finding against a new APK (PLAN §5.6).
+
+    ``fixed`` (exit 0) means every required replay was valid and none of them
+    reproduced the recorded signature. ``still reproduces`` (exit 1) is a
+    verdict too. An *invalid* replay exits 2: an unreplayable trace is an
+    error, never a fix.
+    """
+    import json as jsonlib
+    from pathlib import Path
+
+    from litmus.worker.verify_fix import VerifyFixError, run_verify_fix
+
+    apk_path = Path(apk)
+    if not apk_path.is_file():
+        typer.secho(f"FAIL  apk not found: {apk}", fg="red", err=True)
+        raise typer.Exit(code=2)
+
+    def emit(kind: str, message: str) -> None:
+        if not json_out:
+            typer.echo(f"    {kind:<8} {message}")
+
+    try:
+        result = run_verify_fix(
+            finding=finding,
+            apk=apk_path,
+            run=run,
+            attempts=attempts,
+            serial=serial,
+            on_event=emit,
+        )
+    except VerifyFixError as exc:
+        typer.secho(f"FAIL  {exc}", fg="red", err=True)
+        raise typer.Exit(code=2) from exc
+
+    if json_out:
+        typer.echo(jsonlib.dumps(result.to_dict(), indent=2))
+    else:
+        style = _STYLE["PASS"] if result.verdict == "fixed" else (
+            _STYLE["FAIL"] if result.verdict == "still reproduces" else _STYLE["WARN"]
+        )
+        typer.secho(f"\n{result.verdict}", fg=style, bold=True)
+        typer.echo(f"  {result.reason}")
+        typer.echo(
+            f"  {result.finding_ref}  {result.kind}  {result.signature}  ({result.duration_s:.1f}s)"
+        )
+    raise typer.Exit(code=result.exit_code)
 
 
 def main() -> None:  # pragma: no cover - console script entry point
