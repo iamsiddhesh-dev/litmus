@@ -29,6 +29,9 @@ dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
+    # Needed to run the fixture's mock backend during acceptance runs.
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
 ]
 runner = [
     "uiautomator2>=3.2",
@@ -50,7 +53,7 @@ Homepage = "https://github.com/<owner>/litmus"
 include = ["litmus*"]
 
 [tool.setuptools.package-data]
-litmus = ["db/*.sql"]
+litmus = ["db/*.sql", "worker/*.tmpl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

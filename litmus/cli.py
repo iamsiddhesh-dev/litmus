@@ -56,14 +56,75 @@ def run(
     apk: str = typer.Option(..., "--apk", help="Path to the APK under test."),
     profile: str = typer.Option("generic", "--profile", help="Profile name or path."),
     steps: int = typer.Option(25, "--steps", help="Explore step budget."),
+    serial: str = typer.Option(None, "--serial", help="adb serial (default: attached emulator)."),
+    artifacts_dir: str = typer.Option(
+        None, "--artifacts-dir", help="Where run evidence is written (default: ./artifacts)."
+    ),
 ) -> None:
-    """Run an explore + detect + verify cycle against an APK (available from M1)."""
-    typer.secho(
-        "mqa run is not implemented yet - the runner lands in M1.\n"
-        f"  requested: apk={apk} profile={profile} steps={steps}",
-        fg="yellow",
+    """Explore an APK, detect, replay 3x, and write evidence."""
+    from pathlib import Path
+
+    from litmus.worker.lifecycle import Lifecycle, RunOptions
+
+    apk_path = Path(apk)
+    if not apk_path.is_file():
+        typer.secho(f"FAIL  apk not found: {apk_path}", fg="red", err=True)
+        raise typer.Exit(code=2)
+
+    _COLORS = {
+        "run": "cyan",
+        "device": "cyan",
+        "install": "cyan",
+        "launch": "cyan",
+        "step": "white",
+        "crash": "red",
+        "verify": "cyan",
+        "attempt": "white",
+        "verdict": "green",
+        "evidence": "green",
+        "db": "green",
+        "warn": "yellow",
+        "error": "red",
+    }
+
+    def emit(kind: str, message: str) -> None:
+        style = _COLORS.get(kind, "white")
+        typer.secho(f"{kind:<7} {message}", fg=style)
+
+    options = RunOptions(
+        apk=apk_path,
+        profile=profile,
+        steps=steps,
+        serial=serial,
+        artifacts_dir=Path(artifacts_dir) if artifacts_dir else None,
     )
-    raise typer.Exit(code=2)
+    result = Lifecycle(options, on_event=emit).run()
+
+    typer.echo("")
+    if result.error:
+        typer.secho(f"run failed: {result.error}", fg="red", err=True)
+    for verification, finding in zip(result.verifications, result.findings, strict=False):
+        style = {
+            "confirmed": "green",
+            "flaky": "yellow",
+            "filtered": "yellow",
+        }.get(verification.verdict, "red")
+        typer.secho(
+            f"{verification.verdict} {verification.confirmations}/{verification.valid_attempts}"
+            f"  {finding.local_id}  {finding.kind}  {finding.signature}",
+            fg=style,
+            bold=True,
+        )
+        if finding.evidence_dir:
+            typer.echo(f"        evidence {finding.evidence_dir}")
+    if not result.findings:
+        typer.secho("no findings", fg="yellow")
+
+    typer.echo(
+        f"\nrun {result.run_id}  {result.status}  {result.duration_s:.1f}s  "
+        f"{len(result.steps)} steps  ->  {result.run_dir}"
+    )
+    raise typer.Exit(code=result.exit_code)
 
 
 @app.command()
