@@ -1,0 +1,522 @@
+"""Run lifecycle: install -> explore -> detect -> verify -> evidence (M1).
+
+The loop follows PLAN §5.1: dump, filter to the app package, hash, pick an
+action, act, settle by polling, detect, record. Verification follows §5.2:
+``pm clear``, launch, replay the trace with selectors only, poll for the
+signature, count valid attempts.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import time
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from litmus.config import REPO_ROOT, Settings, get_settings
+from litmus.db import repo
+from litmus.detectors.base import Finding
+from litmus.detectors.crash import CrashDetector, CrashEvent
+from litmus.runner.driver import Driver, Screen
+from litmus.runner.local_avd import LocalAvd
+from litmus.worker import evidence
+from litmus.worker.policy import HeuristicPolicy, StepRecord
+from litmus.worker.verify import AttemptResult, Verification, verify_finding
+
+DEFAULT_WALL_CLOCK_S = 12 * 60
+DEFAULT_SETTLE_CAP_MS = 4000
+POLL_INTERVAL_S = 0.2
+
+
+def load_profile(name_or_path: str) -> tuple[Path, dict[str, Any]]:
+    """Resolve ``bazaar`` or ``profiles/bazaar.yaml`` to a parsed profile."""
+    candidate = Path(name_or_path)
+    if candidate.suffix.lower() in {".yaml", ".yml"} and candidate.is_file():
+        path = candidate
+    else:
+        path = REPO_ROOT / "profiles" / f"{name_or_path}.yaml"
+        if not path.is_file():
+            path = REPO_ROOT / "profiles" / name_or_path
+    if not path.is_file():
+        raise FileNotFoundError(f"profile not found: {name_or_path}")
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return path, data
+
+
+@dataclass(slots=True)
+class RunOptions:
+    apk: Path
+    profile: str = "bazaar"
+    steps: int = 25
+    serial: str | None = None
+    artifacts_dir: Path | None = None
+    wall_clock_s: int = DEFAULT_WALL_CLOCK_S
+    verify: bool = True
+
+
+@dataclass(slots=True)
+class RunResult:
+    run_id: str
+    run_dir: Path
+    status: str = "completed"
+    steps: list[StepRecord] = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)
+    verifications: list[Verification] = field(default_factory=list)
+    confirmations: int = 0
+    duration_s: float = 0.0
+    error: str = ""
+    device_info: dict[str, Any] = field(default_factory=dict)
+    app_info: dict[str, Any] = field(default_factory=dict)
+    bundles: list[evidence.EvidenceBundle] = field(default_factory=list)
+
+    @property
+    def exit_code(self) -> int:
+        return 0 if self.confirmations else 1
+
+
+class Lifecycle:
+    """Owns one end-to-end run against one APK."""
+
+    def __init__(
+        self,
+        options: RunOptions,
+        settings: Settings | None = None,
+        on_event: Callable[[str, str], None] | None = None,
+    ) -> None:
+        self.options = options
+        self.settings = settings or get_settings()
+        self.on_event = on_event or (lambda kind, message: None)
+        self.profile_path, self.profile = load_profile(options.profile)
+        self.package = str(self.profile.get("package") or "").strip()
+        if not self.package:
+            raise ValueError(f"profile {self.profile_path} has no package")
+        self.run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        self.run_dir = (options.artifacts_dir or self.settings.artifacts_dir) / self.run_id
+        self.avd = LocalAvd(self.settings, options.serial)
+        self.crash_detector = CrashDetector(self.package)
+        self.driver: Driver | None = None
+        self.component = ""
+        self._seen_findings: list[Finding] = []
+        self._started_at = datetime.now(UTC)
+
+    # -- entry point ------------------------------------------------------
+    def run(self) -> RunResult:
+        started = time.monotonic()
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        result = RunResult(run_id=self.run_id, run_dir=self.run_dir)
+        self._emit("run", f"{self.run_id}  {self.package}  step budget {self.options.steps}")
+
+        try:
+            driver = self.avd.ensure_device()
+            self.driver = driver
+            driver.package = self.package
+            self.avd.prepare(driver)
+            result.device_info = self.avd.device_info(driver).to_dict()
+            self._emit(
+                "device",
+                f"{result.device_info['serial']}  API {result.device_info['api_level']}  "
+                f"{result.device_info['screen_size']}",
+            )
+
+            driver.clear_logcat("crash")
+            self.avd.install(driver, self.options.apk)
+            result.app_info = self.avd.app_info(driver, self.package)
+            self._emit(
+                "install",
+                f"{self.package} {result.app_info.get('version_name', '?')} installed",
+            )
+
+            driver.clear_app(self.package)
+            driver.clear_logcat("crash")
+            screen = self._launch_and_wait()
+            steps, finding = self._explore(screen)
+            result.steps = steps
+            if finding is not None:
+                result.findings.append(finding)
+
+            if result.findings and self.options.verify:
+                self._verify(result)
+
+            result.confirmations = sum(
+                1 for verification in result.verifications if verification.verdict == "confirmed"
+            )
+
+        except Exception as exc:  # noqa: BLE001 - a run failure is reported, not raised
+            result.status = "failed"
+            result.error = f"{type(exc).__name__}: {exc}"
+            self._emit("error", result.error)
+        finally:
+            result.duration_s = round(time.monotonic() - started, 2)
+            self._write_run_summary(result)
+            self._persist(result)
+
+        return result
+
+    # -- explore ----------------------------------------------------------
+    def _explore(self, screen: Screen) -> tuple[list[StepRecord], Finding | None]:
+        driver = self._driver
+        policy = HeuristicPolicy(self.profile, self.package)
+        steps: list[StepRecord] = []
+        finding: Finding | None = None
+        deadline = time.monotonic() + self.options.wall_clock_s
+        activity = ""
+        activity_hash = ""
+
+        for idx in range(self.options.steps):
+            if time.monotonic() >= deadline:
+                self._emit("warn", "wall-clock budget exhausted")
+                break
+            if not screen.is_rendered(self.package):
+                recovered = self._wait_for_app(timeout_s=5)
+                if recovered is None:
+                    self._emit("warn", "app is not on screen; stopping explore")
+                    break
+                screen = recovered
+            state = screen.state_hash(self.package)
+            if state != activity_hash:
+                activity = driver.current_activity() or activity
+                activity_hash = state
+
+            ime_shown = driver.ime_shown() if screen.edit_texts(self.package) else False
+            action = policy.next_action(screen, state, ime_shown)
+            if action is None:
+                self._emit("warn", "policy found nothing actionable; stopping explore")
+                break
+
+            step = StepRecord(idx=idx, action=action, state_before=state, activity=activity)
+            line = (
+                f"{idx + 1:02d}  {action.kind:<8} {action.target[:28]:<28} "
+                f"{action.reason}"
+            )
+            error = driver.execute(action, screen, self.component)
+            if error:
+                step.result = f"error: {error}"
+                steps.append(step)
+                self._emit("warn", f"{line}  -> {error}")
+                # A stale selector is not a reason to abandon the run: refresh
+                # the screen, stop repeating this target, and try something else.
+                policy.abandon_repeat()
+                recovered = self._wait_for_app(timeout_s=5)
+                if recovered is None:
+                    break
+                screen = recovered
+                continue
+
+            settled, after = self._settle(state)
+            step.state_after = after
+            event = self._detect_crash(wait_ms=1500 if settled is None else 0)
+            if event is not None:
+                step.result = "crash"
+                steps.append(step)
+                self._emit("step", f"{line}  -> CRASH {event.signature}")
+                finding = self._finding_from_crash(event, idx, activity)
+                break
+
+            steps.append(step)
+            policy.observe(action, state, after)
+            self._emit(
+                "step",
+                f"{line}  -> {'changed' if after != state else 'unchanged'}",
+            )
+
+            if settled is None:
+                recovered = self._wait_for_app(timeout_s=8)
+                if recovered is None:
+                    self._emit("warn", "app disappeared without a crash signature")
+                    break
+                screen = recovered
+            else:
+                screen = settled
+
+        return steps, finding
+
+    def _settle(self, before: str) -> tuple[Screen | None, str]:
+        """Poll until the screen changes and settles, or the cap expires.
+
+        A transition needs two things before the next action: the new screen
+        must be up (stability across several polls), and - when nothing changes
+        - enough grace that a slow effect is not recorded as "unchanged". Both
+        loops poll; neither sleeps for a fixed span.
+        """
+        driver = self._driver
+        started = time.monotonic()
+        deadline = started + DEFAULT_SETTLE_CAP_MS / 1000
+        last_screen: Screen | None = None
+        last_hash = before
+        stable = 0
+        failures = 0
+        while time.monotonic() < deadline:
+            time.sleep(POLL_INTERVAL_S)
+            screen = driver.dump()
+            # During a transition the dump can land on the launcher, a system
+            # window, or an app window that has not drawn yet. None of those is
+            # a state change worth recording.
+            if not screen.is_rendered(self.package):
+                failures += 1
+                if failures >= 6:
+                    return None, before
+                continue
+            failures = 0
+            current = screen.state_hash(self.package)
+            last_screen = screen
+            if current != last_hash:
+                last_hash = current
+                stable = 0
+            else:
+                stable += 1
+            if current != before and stable >= 3:
+                # The new screen has held for ~1 s: it is safe to act on it.
+                return screen, current
+        # Nothing changed within the cap. Only now is "unchanged" a fact: a
+        # submit that waits on the network can take longer than a screen push.
+        return last_screen, last_hash
+
+    def _detect_crash(self, wait_ms: int = 0) -> CrashEvent | None:
+        """Read the crash buffer, polling briefly when the app has gone away."""
+        driver = self._driver
+        deadline = time.monotonic() + wait_ms / 1000
+        while True:
+            events = self.crash_detector.detect(driver.logcat("crash"))
+            if events:
+                return events[0]
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(POLL_INTERVAL_S)
+
+    def _finding_from_crash(
+        self, event: CrashEvent, step_idx: int, activity: str
+    ) -> Finding:
+        finding = self.crash_detector.to_finding(
+            event, local_id=f"F{len(self._seen_findings) + 1}", step_idx=step_idx
+        )
+        self._seen_findings.append(finding)
+        if activity:
+            finding.screen = activity.rsplit("/", 1)[-1]
+        screenshot = self.run_dir / "explore" / f"step_{step_idx + 1:02d}_at_bug.png"
+        try:
+            self._driver.screenshot(screenshot)
+            self._emit("evidence", f"screenshot {screenshot.name}")
+        except Exception as exc:  # noqa: BLE001 - a screenshot must not fail the run
+            self._emit("warn", f"screenshot failed: {exc}")
+        return finding
+
+    # -- verification -----------------------------------------------------
+    def _verify(self, result: RunResult) -> None:
+        driver = self._driver
+        verify_profile = self.profile.get("verify") or {}
+        required = int(verify_profile.get("attempts", 3))
+        delay_ms = int(verify_profile.get("inter_attempt_delay_ms", 1500))
+
+        for finding in result.findings:
+            workdir = self.run_dir / "verification" / finding.local_id
+            self._emit("verify", f"{finding.local_id}  {finding.signature}")
+            verification = verify_finding(
+                finding=finding,
+                driver=driver,
+                package=self.package,
+                component=self.component,
+                steps=result.steps,
+                workdir=workdir,
+                required=required,
+                max_tries=5,
+                settle_cap_ms=DEFAULT_SETTLE_CAP_MS,
+                inter_attempt_delay_ms=delay_ms,
+                on_attempt=self._on_attempt,
+            )
+            result.verifications.append(verification)
+            self._emit(
+                "verdict",
+                f"{verification.summary}  {finding.local_id}  {finding.kind}  "
+                f"{finding.signature}",
+            )
+            if verification.verdict in {"confirmed", "flaky"}:
+                bundle = evidence.write_bundle(
+                    run_dir=self.run_dir,
+                    finding=finding,
+                    steps=result.steps,
+                    verification=verification,
+                    run_meta={
+                        "run_id": self.run_id,
+                        "apk": str(self.options.apk),
+                        "profile": str(self.profile_path),
+                        "started_at": self._started_at.isoformat(),
+                    },
+                    device_info=result.device_info,
+                    app_info=result.app_info,
+                    package=self.package,
+                    component=self.component,
+                    settle_cap_ms=DEFAULT_SETTLE_CAP_MS,
+                )
+                result.bundles.append(bundle)
+                self._emit("evidence", f"bundle {bundle.finding_dir}")
+
+    def _on_attempt(self, attempt: AttemptResult) -> None:
+        if attempt.reproduced:
+            detail = "reproduced"
+        elif attempt.valid:
+            detail = "valid, not reproduced"
+        else:
+            detail = f"invalid: {attempt.reason}"
+        self._emit("attempt", f"attempt {attempt.attempt}  {detail}  ({attempt.duration_s:.1f}s)")
+
+    # -- helpers ----------------------------------------------------------
+    def _launch_and_wait(self) -> Screen:
+        driver = self._driver
+        self.component = self.avd.launch(driver, self.package)
+        self._emit("launch", self.component)
+        screen = self._wait_for_app(timeout_s=20)
+        if screen is None:
+            # A system overlay (immersive confirmation, "app keeps stopping")
+            # can sit on top of the app window. One BACK clears it.
+            self._emit("warn", "app not on screen after launch; dismissing an overlay")
+            driver.keyevent(4)
+            screen = self._wait_for_app(timeout_s=10)
+        if screen is None:
+            raise RuntimeError("app did not render its UI after launch")
+        return screen
+
+    def _wait_for_app(self, timeout_s: float = 15) -> Screen | None:
+        driver = self._driver
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            screen = driver.dump()
+            if screen.is_rendered(self.package):
+                return screen
+            time.sleep(0.4)
+        return None
+
+    @property
+    def _driver(self) -> Driver:
+        if self.driver is None:
+            raise RuntimeError("device is not attached")
+        return self.driver
+
+    def _emit(self, kind: str, message: str) -> None:
+        self.on_event(kind, message)
+
+    # -- persistence ------------------------------------------------------
+    def _write_run_summary(self, result: RunResult) -> None:
+        bundles = result.bundles
+        summary = {
+            "run_id": result.run_id,
+            "status": result.status,
+            "error": result.error,
+            "package": self.package,
+            "apk": str(self.options.apk),
+            "profile": str(self.profile_path),
+            "started_at": self._started_at.isoformat(),
+            "ended_at": datetime.now(UTC).isoformat(),
+            "duration_s": result.duration_s,
+            "steps_taken": len(result.steps),
+            "steps": [step.to_dict() for step in result.steps],
+            "device": result.device_info,
+            "app": result.app_info,
+            "findings": [finding.to_dict() for finding in result.findings],
+            "verifications": [item.to_dict() for item in result.verifications],
+            "confirmations": result.confirmations,
+            "evidence": [bundle.to_dict() for bundle in bundles],
+        }
+        (self.run_dir / "run.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    def _persist(self, result: RunResult) -> None:
+        if not self.settings.has_database:
+            self._emit("warn", "DATABASE_URL not set - run not persisted")
+            return
+        bundles = result.bundles
+        version = str(result.app_info.get("version_name", ""))
+        target_id = "tgt_" + hashlib.sha1(
+            f"{self.package}|{version}|{self.options.apk}".encode()
+        ).hexdigest()[:16]
+        started_at = self._started_at
+        record: dict[str, Any] = {
+            "run_id": self.run_id,
+            "target": {
+                "id": target_id,
+                "package": self.package,
+                "version": version,
+                "storage_path": str(self.options.apk),
+                "profile": str(self.profile_path),
+            },
+            "run": {
+                "status": result.status,
+                "step_budget": self.options.steps,
+                "verify_mode": str((self.profile.get("verify") or {}).get("mode", "pm_clear")),
+                "started_at": started_at,
+                "ended_at": datetime.now(UTC),
+                "steps_taken": len(result.steps),
+                "error": result.error or None,
+            },
+            "steps": [
+                {
+                    "idx": step.idx,
+                    "state_hash": step.state_after,
+                    "activity": step.activity,
+                    "action": f"{step.action.kind} {step.action.target}".strip(),
+                    "selector_json": json.dumps(step.action.to_dict()),
+                    "result": step.result,
+                    "ts": step.ts,
+                }
+                for step in result.steps
+            ],
+            "findings": [
+                {
+                    "id": f"{self.run_id}:{finding.local_id}",
+                    "kind": finding.kind,
+                    "signature": finding.signature,
+                    "fingerprint": finding.fingerprint,
+                    "screen": finding.screen,
+                    "first_step_idx": finding.step_idx,
+                    "severity": "high" if finding.confidence == "hard" else "medium",
+                    "confidence": finding.confidence,
+                    "observed_once": finding.observed_once,
+                }
+                for finding in result.findings
+            ],
+            "verdicts": [
+                {
+                    "finding_id": f"{self.run_id}:{finding.local_id}",
+                    "attempt": attempt["attempt"],
+                    "reproduced": attempt["reproduced"],
+                    "state_hash": attempt.get("state_hash"),
+                    "evidence_path": str(finding.evidence_dir) if finding.evidence_dir else None,
+                }
+                for finding in result.findings
+                for attempt in (finding.attempts or [])
+            ],
+            "artifacts": [
+                {
+                    "id": f"{self.run_id}:{bundle.finding_dir.name}:{path.name}",
+                    "finding_id": f"{self.run_id}:{bundle.finding_dir.name}",
+                    "kind": path.name,
+                    "path": str(path),
+                    "bytes": path.stat().st_size if path.is_file() else 0,
+                    "sha256": _sha256(path),
+                }
+                for bundle in bundles
+                for path in bundle.finding_dir.iterdir()
+                if path.is_file()
+            ],
+        }
+        try:
+            asyncio.run(repo.persist_run(self.settings, record))
+            self._emit("db", "run persisted to Postgres")
+        except Exception as exc:  # noqa: BLE001 - persistence is best effort
+            self._emit("warn", f"database persistence skipped: {type(exc).__name__}: {exc}")
+
+
+def _sha256(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
