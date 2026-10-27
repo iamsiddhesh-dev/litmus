@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS runs (
     llm_calls     INTEGER NOT NULL DEFAULT 0,
     tokens        INTEGER NOT NULL DEFAULT 0,
     cost_usd      DOUBLE PRECISION NOT NULL DEFAULT 0,
-    error         TEXT
+    error         TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
@@ -55,7 +56,10 @@ CREATE TABLE IF NOT EXISTS findings (
     first_step_idx  INTEGER,
     severity        TEXT NOT NULL DEFAULT 'medium',
     confidence      TEXT NOT NULL DEFAULT 'heuristic',
-    observed_once   BOOLEAN NOT NULL DEFAULT false
+    observed_once   BOOLEAN NOT NULL DEFAULT false,
+    -- confirmed | flaky | filtered | not_reproduced; written by the verifier so
+    -- the report is reproducible from the database alone (M2).
+    verdict         TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_findings_run ON findings(run_id);
@@ -64,6 +68,9 @@ CREATE TABLE IF NOT EXISTS verdicts (
     finding_id    TEXT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
     attempt       INTEGER NOT NULL,
     reproduced    BOOLEAN NOT NULL,
+    -- An attempt that resolved every selector on the recorded screen. Invalid
+    -- attempts are environment noise and are excluded from the repro rate.
+    valid         BOOLEAN NOT NULL DEFAULT true,
     state_hash    TEXT,
     evidence_path TEXT,
     ts            TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -99,3 +106,8 @@ CREATE TABLE IF NOT EXISTS workers (
     status          TEXT NOT NULL DEFAULT 'idle',
     last_heartbeat  TIMESTAMPTZ
 );
+
+-- Idempotent upgrades for databases created before M2. No migrations in v1.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS verdict TEXT;
+ALTER TABLE verdicts ADD COLUMN IF NOT EXISTS valid BOOLEAN NOT NULL DEFAULT true;

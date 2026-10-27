@@ -28,12 +28,27 @@ from litmus.detectors.crash import CrashDetector, CrashEvent
 from litmus.runner.driver import Driver, Screen
 from litmus.runner.local_avd import LocalAvd
 from litmus.worker import evidence
+from litmus.worker.events import (
+    DONE,
+    FINDING_CANDIDATE,
+    REPORT_READY,
+    RUN_STATUS,
+    STEP,
+    VERDICT,
+    WARNING,
+    EventSink,
+    NullSink,
+)
 from litmus.worker.policy import HeuristicPolicy, StepRecord
 from litmus.worker.verify import AttemptResult, Verification, verify_finding
 
 DEFAULT_WALL_CLOCK_S = 12 * 60
 DEFAULT_SETTLE_CAP_MS = 4000
 POLL_INTERVAL_S = 0.2
+
+
+class RunCancelled(Exception):
+    """Raised internally when a run is cancelled from the dashboard."""
 
 
 def load_profile(name_or_path: str) -> tuple[Path, dict[str, Any]]:
@@ -60,13 +75,20 @@ class RunOptions:
     artifacts_dir: Path | None = None
     wall_clock_s: int = DEFAULT_WALL_CLOCK_S
     verify: bool = True
+    #: Supplied by the control plane so the run row, the event stream and the
+    #: evidence directory all share one id. Generated when the CLI drives a run.
+    run_id: str | None = None
+    #: Supplied by the control plane so persistence updates the uploaded target
+    #: instead of registering a second one for the same APK.
+    target_id: str | None = None
 
 
 @dataclass(slots=True)
 class RunResult:
     run_id: str
     run_dir: Path
-    status: str = "completed"
+    #: Terminal state of the M2 state machine: done | failed | cancelled.
+    status: str = "done"
     steps: list[StepRecord] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
     verifications: list[Verification] = field(default_factory=list)
@@ -90,15 +112,25 @@ class Lifecycle:
         options: RunOptions,
         settings: Settings | None = None,
         on_event: Callable[[str, str], None] | None = None,
+        sink: EventSink | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         self.options = options
         self.settings = settings or get_settings()
         self.on_event = on_event or (lambda kind, message: None)
+        # The CLI leaves the sink empty; the worker passes a StoreSink so every
+        # phase, step and verdict lands in the events table for the dashboard.
+        self.sink = sink or NullSink()
+        # Polled by the worker so ``POST /v1/runs/{id}/cancel`` stops a run that
+        # is already exploring the device.
+        self.cancel_check = cancel_check or (lambda: False)
         self.profile_path, self.profile = load_profile(options.profile)
         self.package = str(self.profile.get("package") or "").strip()
         if not self.package:
             raise ValueError(f"profile {self.profile_path} has no package")
-        self.run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        self.run_id = options.run_id or (
+            time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        )
         self.run_dir = (options.artifacts_dir or self.settings.artifacts_dir) / self.run_id
         self.avd = LocalAvd(self.settings, options.serial)
         self.crash_detector = CrashDetector(self.package)
@@ -113,6 +145,12 @@ class Lifecycle:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         result = RunResult(run_id=self.run_id, run_dir=self.run_dir)
         self._emit("run", f"{self.run_id}  {self.package}  step budget {self.options.steps}")
+        self._status(
+            "provisioning",
+            package=self.package,
+            apk=str(self.options.apk),
+            profile=str(self.profile_path),
+        )
 
         try:
             driver = self.avd.ensure_device()
@@ -126,6 +164,7 @@ class Lifecycle:
                 f"{result.device_info['screen_size']}",
             )
 
+            self._status("installing", package=self.package)
             driver.clear_logcat("crash")
             self.avd.install(driver, self.options.apk)
             result.app_info = self.avd.app_info(driver, self.package)
@@ -136,6 +175,7 @@ class Lifecycle:
 
             driver.clear_app(self.package)
             driver.clear_logcat("crash")
+            self._status("exploring", step_budget=self.options.steps)
             screen = self._launch_and_wait()
             steps, finding = self._explore(screen)
             result.steps = steps
@@ -143,22 +183,54 @@ class Lifecycle:
                 result.findings.append(finding)
 
             if result.findings and self.options.verify:
+                self._status("verifying", findings=len(result.findings))
                 self._verify(result)
 
             result.confirmations = sum(
                 1 for verification in result.verifications if verification.verdict == "confirmed"
             )
+            self._status("reporting", steps_taken=len(result.steps))
 
+        except RunCancelled:
+            result.status = "cancelled"
+            self._warn("run cancelled by user")
         except Exception as exc:  # noqa: BLE001 - a run failure is reported, not raised
             result.status = "failed"
             result.error = f"{type(exc).__name__}: {exc}"
-            self._emit("error", result.error)
+            self._warn(result.error, kind="error")
         finally:
             result.duration_s = round(time.monotonic() - started, 2)
             self._write_run_summary(result)
             self._persist(result)
+            self._finish(result)
 
         return result
+
+    def _finish(self, result: RunResult) -> None:
+        """Announce that the report is queryable, then close the run."""
+        if result.status == "done":
+            self.sink.emit(
+                REPORT_READY,
+                {
+                    "report_url": f"/v1/runs/{self.run_id}/report",
+                    "steps": len(result.steps),
+                    "confirmations": result.confirmations,
+                },
+            )
+        counts = {"confirmed": 0, "flaky": 0, "filtered": 0}
+        for verification in result.verifications:
+            if verification.verdict in counts:
+                counts[verification.verdict] += 1
+        self.sink.emit(
+            DONE,
+            {
+                "status": result.status,
+                "steps_taken": len(result.steps),
+                "duration_s": result.duration_s,
+                "error": result.error or None,
+                **counts,
+            },
+        )
 
     # -- explore ----------------------------------------------------------
     def _explore(self, screen: Screen) -> tuple[list[StepRecord], Finding | None]:
@@ -171,13 +243,15 @@ class Lifecycle:
         activity_hash = ""
 
         for idx in range(self.options.steps):
+            if self.cancel_check():
+                raise RunCancelled("cancelled from the dashboard")
             if time.monotonic() >= deadline:
-                self._emit("warn", "wall-clock budget exhausted")
+                self._warn("wall-clock budget exhausted")
                 break
             if not screen.is_rendered(self.package):
                 recovered = self._wait_for_app(timeout_s=5)
                 if recovered is None:
-                    self._emit("warn", "app is not on screen; stopping explore")
+                    self._warn("app is not on screen; stopping explore")
                     break
                 screen = recovered
             state = screen.state_hash(self.package)
@@ -188,7 +262,7 @@ class Lifecycle:
             ime_shown = driver.ime_shown() if screen.edit_texts(self.package) else False
             action = policy.next_action(screen, state, ime_shown)
             if action is None:
-                self._emit("warn", "policy found nothing actionable; stopping explore")
+                self._warn("policy found nothing actionable; stopping explore")
                 break
 
             step = StepRecord(idx=idx, action=action, state_before=state, activity=activity)
@@ -200,7 +274,8 @@ class Lifecycle:
             if error:
                 step.result = f"error: {error}"
                 steps.append(step)
-                self._emit("warn", f"{line}  -> {error}")
+                self._event(STEP, self._step_payload(step, state, ""))
+                self._warn(f"{line}  -> {error}")
                 # A stale selector is not a reason to abandon the run: refresh
                 # the screen, stop repeating this target, and try something else.
                 policy.abandon_repeat()
@@ -217,6 +292,7 @@ class Lifecycle:
                 step.result = "crash"
                 steps.append(step)
                 self._emit("step", f"{line}  -> CRASH {event.signature}")
+                self._event(STEP, self._step_payload(step, state, after))
                 finding = self._finding_from_crash(event, idx, activity)
                 break
 
@@ -226,11 +302,12 @@ class Lifecycle:
                 "step",
                 f"{line}  -> {'changed' if after != state else 'unchanged'}",
             )
+            self._event(STEP, self._step_payload(step, state, after))
 
             if settled is None:
                 recovered = self._wait_for_app(timeout_s=8)
                 if recovered is None:
-                    self._emit("warn", "app disappeared without a crash signature")
+                    self._warn("app disappeared without a crash signature")
                     break
                 screen = recovered
             else:
@@ -301,11 +378,21 @@ class Lifecycle:
         if activity:
             finding.screen = activity.rsplit("/", 1)[-1]
         screenshot = self.run_dir / "explore" / f"step_{step_idx + 1:02d}_at_bug.png"
+        screenshot_name: str | None = None
         try:
             self._driver.screenshot(screenshot)
+            screenshot_name = screenshot.name
             self._emit("evidence", f"screenshot {screenshot.name}")
         except Exception as exc:  # noqa: BLE001 - a screenshot must not fail the run
-            self._emit("warn", f"screenshot failed: {exc}")
+            self._warn(f"screenshot failed: {exc}")
+        self._event(
+            FINDING_CANDIDATE,
+            {
+                "finding": finding.to_dict(),
+                "step_idx": step_idx + 1,
+                "screenshot": screenshot_name,
+            },
+        )
         return finding
 
     # -- verification -----------------------------------------------------
@@ -316,6 +403,8 @@ class Lifecycle:
         delay_ms = int(verify_profile.get("inter_attempt_delay_ms", 1500))
 
         for finding in result.findings:
+            if self.cancel_check():
+                raise RunCancelled("cancelled from the dashboard")
             workdir = self.run_dir / "verification" / finding.local_id
             self._emit("verify", f"{finding.local_id}  {finding.signature}")
             verification = verify_finding(
@@ -329,13 +418,27 @@ class Lifecycle:
                 max_tries=5,
                 settle_cap_ms=DEFAULT_SETTLE_CAP_MS,
                 inter_attempt_delay_ms=delay_ms,
-                on_attempt=self._on_attempt,
+                on_attempt=lambda attempt, finding=finding: self._on_attempt(finding, attempt),
             )
             result.verifications.append(verification)
             self._emit(
                 "verdict",
                 f"{verification.summary}  {finding.local_id}  {finding.kind}  "
                 f"{finding.signature}",
+            )
+            self._event(
+                VERDICT,
+                {
+                    "finding_id": finding.local_id,
+                    "kind": finding.kind,
+                    "signature": finding.signature,
+                    "confidence": finding.confidence,
+                    "verdict": verification.verdict,
+                    "summary": verification.summary,
+                    "confirmations": verification.confirmations,
+                    "valid_attempts": verification.valid_attempts,
+                    "reason": verification.reason,
+                },
             )
             if verification.verdict in {"confirmed", "flaky"}:
                 bundle = evidence.write_bundle(
@@ -358,7 +461,7 @@ class Lifecycle:
                 result.bundles.append(bundle)
                 self._emit("evidence", f"bundle {bundle.finding_dir}")
 
-    def _on_attempt(self, attempt: AttemptResult) -> None:
+    def _on_attempt(self, finding: Finding, attempt: AttemptResult) -> None:
         if attempt.reproduced:
             detail = "reproduced"
         elif attempt.valid:
@@ -366,6 +469,19 @@ class Lifecycle:
         else:
             detail = f"invalid: {attempt.reason}"
         self._emit("attempt", f"attempt {attempt.attempt}  {detail}  ({attempt.duration_s:.1f}s)")
+        self._event(
+            VERDICT,
+            {
+                "finding_id": finding.local_id,
+                "kind": finding.kind,
+                "attempt": attempt.attempt,
+                "valid": attempt.valid,
+                "reproduced": attempt.reproduced,
+                "reason": attempt.reason,
+                "duration_s": round(attempt.duration_s, 2),
+                "state_hash": attempt.state_hash,
+            },
+        )
 
     # -- helpers ----------------------------------------------------------
     def _launch_and_wait(self) -> Screen:
@@ -376,7 +492,7 @@ class Lifecycle:
         if screen is None:
             # A system overlay (immersive confirmation, "app keeps stopping")
             # can sit on top of the app window. One BACK clears it.
-            self._emit("warn", "app not on screen after launch; dismissing an overlay")
+            self._warn("app not on screen after launch; dismissing an overlay")
             driver.keyevent(4)
             screen = self._wait_for_app(timeout_s=10)
         if screen is None:
@@ -401,6 +517,33 @@ class Lifecycle:
 
     def _emit(self, kind: str, message: str) -> None:
         self.on_event(kind, message)
+
+    def _event(self, type_: str, payload: dict[str, Any]) -> None:
+        """Persist a structured event for the dashboard (SSE) consumers."""
+        self.sink.emit(type_, payload)
+
+    def _status(self, phase: str, **extra: Any) -> None:
+        """Move the run through one state-machine phase."""
+        self._emit("status", phase)
+        self._event(RUN_STATUS, {"status": phase, "run_id": self.run_id, **extra})
+
+    def _warn(self, message: str, kind: str = "warn") -> None:
+        self._emit(kind, message)
+        self._event(WARNING, {"message": message})
+
+    @staticmethod
+    def _step_payload(step: StepRecord, before: str, after: str) -> dict[str, Any]:
+        return {
+            "idx": step.idx + 1,
+            "action": step.action.kind,
+            "target": step.action.target,
+            "reason": step.action.reason,
+            "result": step.result,
+            "activity": step.activity,
+            "state_before": before,
+            "state_after": after,
+            "changed": bool(after) and after != before,
+        }
 
     # -- persistence ------------------------------------------------------
     def _write_run_summary(self, result: RunResult) -> None:
@@ -428,13 +571,14 @@ class Lifecycle:
 
     def _persist(self, result: RunResult) -> None:
         if not self.settings.has_database:
-            self._emit("warn", "DATABASE_URL not set - run not persisted")
+            self._warn("DATABASE_URL not set - run not persisted")
             return
         bundles = result.bundles
         version = str(result.app_info.get("version_name", ""))
-        target_id = "tgt_" + hashlib.sha1(
-            f"{self.package}|{version}|{self.options.apk}".encode()
-        ).hexdigest()[:16]
+        target_id = self.options.target_id or (
+            "tgt_"
+            + hashlib.sha1(f"{self.package}|{version}|{self.options.apk}".encode()).hexdigest()[:16]
+        )
         started_at = self._started_at
         record: dict[str, Any] = {
             "run_id": self.run_id,
@@ -477,6 +621,7 @@ class Lifecycle:
                     "severity": "high" if finding.confidence == "hard" else "medium",
                     "confidence": finding.confidence,
                     "observed_once": finding.observed_once,
+                    "verdict": finding.verdict,
                 }
                 for finding in result.findings
             ],
@@ -485,6 +630,7 @@ class Lifecycle:
                     "finding_id": f"{self.run_id}:{finding.local_id}",
                     "attempt": attempt["attempt"],
                     "reproduced": attempt["reproduced"],
+                    "valid": attempt.get("valid", True),
                     "state_hash": attempt.get("state_hash"),
                     "evidence_path": str(finding.evidence_dir) if finding.evidence_dir else None,
                 }
@@ -509,7 +655,7 @@ class Lifecycle:
             asyncio.run(repo.persist_run(self.settings, record))
             self._emit("db", "run persisted to Postgres")
         except Exception as exc:  # noqa: BLE001 - persistence is best effort
-            self._emit("warn", f"database persistence skipped: {type(exc).__name__}: {exc}")
+            self._warn( f"database persistence skipped: {type(exc).__name__}: {exc}")
 
 
 def _sha256(path: Path) -> str | None:

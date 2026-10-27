@@ -97,13 +97,15 @@ async def persist_run(settings: Settings, record: dict[str, Any]) -> None:
                     """
                     INSERT INTO findings (
                         id, run_id, kind, signature, fingerprint, screen,
-                        first_step_idx, severity, confidence, observed_once
+                        first_step_idx, severity, confidence, observed_once, verdict
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     ON CONFLICT (id) DO UPDATE SET
                         signature = EXCLUDED.signature,
                         fingerprint = EXCLUDED.fingerprint,
-                        confidence = EXCLUDED.confidence
+                        confidence = EXCLUDED.confidence,
+                        verdict = EXCLUDED.verdict,
+                        observed_once = EXCLUDED.observed_once
                     """,
                     finding["id"],
                     record["run_id"],
@@ -115,23 +117,27 @@ async def persist_run(settings: Settings, record: dict[str, Any]) -> None:
                     finding.get("severity", "high"),
                     finding.get("confidence", "heuristic"),
                     finding.get("observed_once", True),
+                    finding.get("verdict"),
                 )
 
             for verdict in record.get("verdicts", []):
                 await conn.execute(
                     """
                     INSERT INTO verdicts (
-                        finding_id, attempt, reproduced, state_hash, evidence_path, ts
+                        finding_id, attempt, reproduced, valid, state_hash,
+                        evidence_path, ts
                     )
-                    VALUES ($1, $2, $3, $4, $5, to_timestamp($6))
+                    VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))
                     ON CONFLICT (finding_id, attempt) DO UPDATE SET
                         reproduced = EXCLUDED.reproduced,
+                        valid = EXCLUDED.valid,
                         state_hash = EXCLUDED.state_hash,
                         evidence_path = EXCLUDED.evidence_path
                     """,
                     verdict["finding_id"],
                     verdict["attempt"],
                     verdict["reproduced"],
+                    verdict.get("valid", True),
                     verdict.get("state_hash"),
                     verdict.get("evidence_path"),
                     verdict.get("ts", datetime.now().timestamp()),

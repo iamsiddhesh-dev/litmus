@@ -28,7 +28,20 @@ mqa bench --fixture bazaar --runs 3
 
 ## Quick start
 
-_(Filled in as the implementation lands: `mqa doctor`, upload APK, dashboard URL.)_
+```powershell
+python -m venv .venv; .venv\Scripts\pip install -e ".[dev]"
+.\.venv\Scripts\mqa.exe doctor          # python, adb, AVD, Postgres, Redis
+
+.\.venv\Scripts\python.exe -m litmus.api             # dashboard + REST + SSE on 127.0.0.1:8000
+.\.venv\Scripts\arq.exe litmus.worker.WorkerSettings # the run state machine (needs Redis)
+```
+
+Open `http://127.0.0.1:8000`, upload an APK, start a run and watch the steps
+stream. The CLI stays available: `mqa run --apk <path> --profile bazaar --steps 25`.
+
+`POST /v1/runs` queues the job on Arq. If Redis is down it still runs the
+lifecycle inline in the API process (single-process dev fallback); Arq is the
+supported path and the only one that keeps the API stateless.
 
 ## License
 
