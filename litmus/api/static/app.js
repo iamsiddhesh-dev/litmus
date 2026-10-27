@@ -110,7 +110,10 @@
       item.appendChild(el("span", `run-dot ${dotClass}`));
       const main = el("span", "run-main");
       main.appendChild(el("span", "run-pkg", run.package || "unknown package"));
-      const meta = [run.status, relativeTime(run.created_at)];
+      // Runs persisted before the state machine settled on "done" still say
+      // "completed"; show one vocabulary.
+      const status = run.status === "completed" ? "done" : run.status;
+      const meta = [status, relativeTime(run.created_at)];
       if (run.steps_taken) meta.push(`${run.steps_taken} steps`);
       main.appendChild(el("span", "run-meta", meta.filter(Boolean).join(" · ")));
       item.appendChild(main);
